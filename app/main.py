@@ -12,7 +12,7 @@ from alembic.config import Config as AlembicConfig
 from app.database.postgres import connect_postgres, close_postgres
 from app.database.neo4j import connect_neo4j, close_neo4j, ensure_graph_schema
 from app.lib.redis_cache import connect_redis, close_redis
-from app.routes import auth, health, chat, stocks, library, admin, system, quant, ml, macro, documents, notification, graph, conversations, tasks, ingest
+from app.routes import auth, health, chat, stocks, library, admin, system, quant, ml, macro, documents, notification, graph, conversations, tasks, ingest, paper, openapi, lean
 from app.services.graph_service import seed_graph
 from app.services.sync_scheduler import start_sync_scheduler, stop_sync_scheduler
 
@@ -65,8 +65,7 @@ app = FastAPI(
 )
 
 # 라우터 등록
-# auth/ingest는 프로덕션(AWS)에서 auth-service/crawl-service Lambda로도 분리 배포되지만,
-# 로컬 docker-compose 단일 앱 실행 시에도 동작하도록 메인 앱에도 등록한다.
+# auth/ingest도 메인 앱에 함께 등록한다 (강사님 원본의 Lambda 분리 배포는 AWS 제거로 뺐다).
 app.include_router(auth.router)
 app.include_router(ingest.router)
 app.include_router(health.router)
@@ -83,6 +82,11 @@ app.include_router(notification.router)
 app.include_router(graph.router)
 app.include_router(conversations.router)
 app.include_router(tasks.router)
+# 모의투자(주식·코인·대체자산) + Open API 키 — stock-coin-trade 이식
+app.include_router(paper.router)
+app.include_router(openapi.router)
+# QuantConnect LEAN 백테스트 — domain-rag-lab 이식
+app.include_router(lean.router)
 
 # 정적 파일 (프론트엔드)
 _public = os.path.join(os.path.dirname(__file__), "..", "public")
