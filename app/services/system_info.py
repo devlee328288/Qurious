@@ -105,46 +105,6 @@ async def _llm_provider_status() -> dict:
         ok, ms = await _ping_http(f"{settings.VLLM_BASE_URL}/v1/models") if settings.VLLM_BASE_URL else (False, -1)
         return {"provider": "vllm", "target": settings.VLLM_BASE_URL, "ok": ok, "ms": ms}
 
-    if provider == "bedrock":
-        if not settings.BEDROCK_MODEL_ID:
-            return {"provider": "bedrock", "target": "", "ok": False, "ms": -1, "error": "BEDROCK_MODEL_ID 미설정"}
-        try:
-            import boto3
-
-            t0 = asyncio.get_event_loop().time()
-
-            def _check():
-                client = boto3.client("bedrock", region_name=settings.AWS_REGION)
-                client.get_foundation_model(modelIdentifier=settings.BEDROCK_MODEL_ID)
-
-            await asyncio.to_thread(_check)
-            ms = round((asyncio.get_event_loop().time() - t0) * 1000, 1)
-            return {"provider": "bedrock", "target": settings.BEDROCK_MODEL_ID, "ok": True, "ms": ms}
-        except Exception as e:
-            return {"provider": "bedrock", "target": settings.BEDROCK_MODEL_ID, "ok": False, "ms": -1, "error": str(e)[:200]}
-
-    if provider == "sagemaker":
-        if not settings.SAGEMAKER_ENDPOINT_NAME:
-            return {"provider": "sagemaker", "target": "", "ok": False, "ms": -1, "error": "SAGEMAKER_ENDPOINT_NAME 미설정"}
-        try:
-            import boto3
-
-            t0 = asyncio.get_event_loop().time()
-
-            def _check():
-                client = boto3.client("sagemaker", region_name=settings.AWS_REGION)
-                resp = client.describe_endpoint(EndpointName=settings.SAGEMAKER_ENDPOINT_NAME)
-                return resp["EndpointStatus"]
-
-            status = await asyncio.to_thread(_check)
-            ms = round((asyncio.get_event_loop().time() - t0) * 1000, 1)
-            return {
-                "provider": "sagemaker", "target": settings.SAGEMAKER_ENDPOINT_NAME,
-                "ok": status == "InService", "ms": ms, "endpoint_status": status,
-            }
-        except Exception as e:
-            return {"provider": "sagemaker", "target": settings.SAGEMAKER_ENDPOINT_NAME, "ok": False, "ms": -1, "error": str(e)[:200]}
-
     return {"provider": provider, "target": "", "ok": False, "ms": -1, "error": "알 수 없는 LLM_PROVIDER"}
 
 

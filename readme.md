@@ -23,10 +23,9 @@
 4. [아키텍처](#아키텍처)
 5. [로컬 실행 가이드](#로컬-실행-가이드)
 6. [환경변수](#환경변수)
-7. [AWS 이관 가이드](#aws-이관-가이드)
-8. [Qdrant 구성 제안](#qdrant-구성-제안)
-9. [Qdrant 데이터 공유 방법](#qdrant-데이터-공유-방법)
-10. [주요 화면](#주요-화면)
+7. [Qdrant 구성 제안](#qdrant-구성-제안)
+8. [Qdrant 데이터 공유 방법](#qdrant-데이터-공유-방법)
+9. [주요 화면](#주요-화면)
 
 ---
 
@@ -41,7 +40,7 @@
 | 1 | 데이터 기초 | SQLite 쿼리, MongoDB 기본 CRUD, Redis 세션 개념 |
 | 2 | LLM / RAG | Ollama 모델 관리, 임베딩, Qdrant 컬렉션/업서트/검색 |
 | 2 | 금융 데이터 처리 | pandas/numpy 기반 지표 계산(RSI, SMA, Bollinger) |
-| 3 | 운영/배포 | 환경변수 관리, AWS(ECS/Fargate) 배포 흐름, 모니터링 기초 |
+| 3 | 운영/배포 | 환경변수 관리, 로컬·온프레미스 배포 흐름, 모니터링 기초 |
 
 ### 2) 본인 PC 사양 가이드
 
@@ -63,7 +62,6 @@
 |---|---|---|
 | GitHub | 필수 | 코드 접근, 토큰 발급(`GITHUB_TOKEN`) 시 크롤링 rate limit 완화 |
 | Docker Hub 계정 | 권장 | 도커 이미지 pull rate limit 관리 |
-| AWS 계정 | 선택 | 문서의 AWS 이관 가이드(ECS/Fargate, ElastiCache, DocumentDB 등) 적용 시 |
 | Qdrant Cloud 계정 | 선택 | 로컬 대신 관리형 벡터DB 사용 시 |
 | 증권 API 계정(Alpaca/키움/토스 등) | 선택 | 현재는 Mock 기반, 실거래/외부 연동 확장 시 필요 |
 
@@ -73,7 +71,6 @@
 |---|---|---|
 | 로컬 개발만 사용 | **0원 ~ 2만원** | 기본은 무료, 필요 시 유료 IDE/클라우드 스토리지 구독 정도 |
 | 로컬 + Qdrant Cloud(PoC) | **2만원 ~ 8만원** | 사용량/플랜에 따라 변동 |
-| AWS 소규모 운영 병행 | **30만원 ~ 150만원+** | ECS, Redis, DocumentDB, GPU(OLLAMA용 EC2) 포함 시 급증 가능 |
 
 > 비용은 2026년 기준 일반적인 사용 패턴 기준의 보수적 범위입니다.  
 > 실제 청구액은 사용 시간, 저장 용량, 트래픽, GPU 사양에 따라 달라집니다.
@@ -87,7 +84,8 @@
 | **금융정보 Agent** | ReAct 루프 기반 AI 챗봇. 개인CB / 기업CB / 금융상품 CSV를 SQLite로 집계 후 자연어 질의 |
 | **크롤링** | GitHub docs (python-quant) 크롤링 → Qdrant RAG. URL 직접 크롤링 지원 |
 | **직접매매** | 가상 포트폴리오 관리, 매수/매도 주문, 키움증권·토스증권 API Mockup |
-| **퀀트자동매매** | RSI·SMA·볼린저밴드 시그널, 10분 주기 Agentic AI 자동매매 Mockup, 10년 백테스트 |
+| **모의투자** | (stock-coin-trade 이식) 공유 현금 1억원 모의계좌 — 국내주식 실시간 시세 모의주문·미리보기·계좌 리셋, Upbit KRW 마켓 코인 모의매매(국내 거래소 가격 비교·거래대금 랭킹), 대체자산(선물·옵션·파생 ETN·금·은·부동산 지분) 모의주문, 외부 시스템용 Open API 키 발급(`/openapi/v1`), Alpaca Paper 읽기 전용 연결 테스트 |
+| **퀀트자동매매** | RSI·SMA·볼린저밴드 시그널, 10분 주기 Agentic AI 자동매매 Mockup, 10년 백테스트, **QuantConnect LEAN 백테스트**(domain-rag-lab 이식: Yahoo 일봉 → LEAN Docker 실행, 매수후보유·MA교차·DCA·모멘텀 전략) |
 
 ---
 
@@ -191,6 +189,13 @@ flowchart TD
 
 ## 아키텍처
 
+배포 환경별 상세 목표 설계서는 다음 문서를 기준으로 합니다.
+
+- [온프레미스 아키텍처 설계서](onprem.md): Docker Compose, Kubernetes, 로컬 Ollama, NVIDIA GPU, 데이터·보안·백업·관측성
+- [데이터 파이프라인 설계서](pipeline.md): 주식 백데이터 원천 인벤토리, 수집 스케줄, 캐시·적재 스키마, OHLCV/텍스트 전처리 규칙, 히스토리 테이블 목표안
+
+> 아래 구성도와 이 README의 일부 로컬 설명에는 과거 MongoDB/SQLite 기준 내용이 남아 있습니다. 신규 인프라 설계는 현재 코드의 PostgreSQL/Redis/Neo4j/Celery 및 선택형 LLM provider를 반영한 위 두 설계서를 우선합니다.
+
 ```
 Browser
   │
@@ -282,63 +287,66 @@ docker compose run --rm ingest
 | `QDRANT_URL` | `http://localhost:6333` | Qdrant 서버 주소 |
 | `QDRANT_COLLECTION` | `fin_chunks` | Qdrant 컬렉션명 |
 | `GITHUB_TOKEN` | — | GitHub API rate limit 완화 |
+| `LEAN_MODE` | `auto` | LEAN 백테스트 실행 방식 `auto\|ssh\|docker\|local` (아래 참고) |
+| `LEAN_DOCKER_IMAGE` | `quantconnect/lean:latest` | LEAN 엔진 이미지 |
+| `LEAN_SSH_HOST` / `LEAN_SSH_KEY_PATH` | — | ssh 모드: 원격 LEAN 실행 서버 |
+| `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` | — | Alpaca Paper 연결 테스트·퀀트 파이프라인 주문 |
+| `OPENAPI_RATE_LIMIT_MAX` | `60` | Open API 키당 분당 호출 제한 |
 
 ---
 
-## AWS 이관 가이드
+## 모의투자 · Open API (stock-coin-trade 이식)
 
-### 권장 아키텍처
+`/home/ubuntu/stock-coin-trade`(Flask + MariaDB)의 모의투자 기능을 FastAPI + PostgreSQL 구조로 옮긴 것이다.
+주식·코인·대체자산이 `paper_accounts.cash`(유저당 1행, 초기 1억원) 하나를 공유하며, 주식 포지션/주문은
+기존 직접매매 화면의 `portfolio` / `orders` 테이블을 그대로 재사용한다(직접매매의 가상 주문도 이 현금과 연동).
 
-```
-Internet
-    │
-    ▼
-Route 53 → CloudFront (정적 자산 캐싱)
-    │
-    ▼
-ALB (HTTPS, ACM 인증서)
-    │
-    ▼
-ECS Fargate (fin-ai-app)
-  ├── Task: FastAPI + Uvicorn
-  ├── ECR: Docker 이미지
-  └── EFS: data/ 볼륨 (SQLite, CSV)
-    │
-    ├── DocumentDB (MongoDB 호환) or Atlas
-    ├── ElastiCache for Redis (Serverless 또는 r7g.large)
-    ├── Ollama on EC2 (G4dn / G5 GPU 인스턴스)
-    │     └── EFS 마운트: /root/.ollama
-    └── Qdrant (아래 섹션 참고)
+| 화면 (GNB 모의투자) | API | 원본 |
+|---|---|---|
+| 모의계좌 현황 | `GET /api/paper/account`, `POST /api/paper/account/reset` | `stocks.py` account/reset |
+| 국내주식 모의주문 | `GET /api/paper/stocks/quote`, `POST /api/paper/stocks/orders[/preview\|/buy\|/sell\|/pine]`, `GET /api/paper/stocks/positions\|orders/history` | `stock_trading.py`, `stocks.py` |
+| 코인 모의매매 | `GET /api/paper/crypto/market-list\|rankings\|ticker\|{code}/candles\|{code}/domestic-prices`, `GET /api/paper/trade/hold`, `POST /api/paper/trade/order/buy\|sell\|preview` | `crypto.py` |
+| 대체자산 | `GET /api/paper/alternatives/markets[/{symbol}/chart]\|positions\|orders/history`, `POST /api/paper/alternatives/orders[/preview]` | `alternatives.py` |
+| Open API 키 | `GET/POST /api/paper/api-keys`, `DELETE /api/paper/api-keys/{id}` | `api_keys.py` |
+| Alpaca 연결 테스트 | `POST /api/paper/alpaca/account\|positions` (읽기 전용) | `alpaca_test.py` |
+
+외부 시스템은 발급받은 키로 `/openapi/v1/*`를 호출한다 (`Authorization: Bearer <key>`, 키당 분당 60회):
+
+```bash
+curl -H "Authorization: Bearer $KEY" http://localhost:8966/openapi/v1/quote/005930
+curl -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+     -d '{"symbol":"005930","side":"BUY","quantity":10}' http://localhost:8966/openapi/v1/orders
 ```
 
-### ECS Fargate 태스크 정의 요점
+엔드포인트: `GET /stocks`, `GET /quote/{symbol}`, `GET /account`, `GET /positions`, `POST /orders`, `GET /orders`,
+`GET /crypto/hold`, `GET /alternatives/positions`. 오류 응답은 원본과 같은 `{"error": CODE, "message": ...}` 형식이다.
 
-```json
-{
-  "cpu": "1024",
-  "memory": "2048",
-  "portMappings": [{"containerPort": 8000}],
-  "environment": [
-    {"name": "OLLAMA_BASE_URL", "value": "http://<ollama-ec2-private-ip>:11434"},
-    {"name": "QDRANT_URL",      "value": "http://<qdrant-ec2-private-ip>:6333"}
-  ],
-  "secrets": [
-    {"name": "MONGO_URI",   "valueFrom": "arn:aws:secretsmanager:..."},
-    {"name": "REDIS_URL",   "valueFrom": "arn:aws:secretsmanager:..."}
-  ]
-}
+> 원본 중 이식하지 않은 것: 봇 계정 자동 매매(`market_bots.py`), API 사용 이력·오류 분석 화면, 4일 커리큘럼 문서, KIS MCP 서버.
+> 증권사 읽기 전용 테스트(KIS/KB)는 이미 있는 `/api/broker/*`(brokers/ 어댑터)가 같은 역할을 한다.
+
+## QuantConnect LEAN 백테스트 (domain-rag-lab 이식)
+
+`/home/ubuntu/domain-rag-lab`의 `lean_backtest_service.py` + `/backtests/run`을 `app/services/lean_backtest.py`,
+`POST /api/backtests/lean/run`으로 옮겼다. 화면은 GNB **퀀트자동매매 > LEAN 백테스트**.
+
+흐름: Yahoo Finance 일봉(httpx, yfinance 불필요) → `prices.csv` + 전략별 LEAN 알고리즘(`main.py`) 생성 →
+`quantconnect/lean` 컨테이너 실행(`--environment backtesting --algorithm-language Python ...`) →
+`*-summary.json` 통계 + 로그 회수 → pandas로 계산한 수익률·MDD·샤프·시장 노출 일수와 함께 반환.
+LEAN이 Initialize() 전에 요구하는 `market-hours` / `symbol-properties` 참조 데이터는
+`app/services/lean_reference_data/`에 벤더링되어 있다.
+
+| `LEAN_MODE` | 동작 | 출처 |
+|---|---|---|
+| `docker` | 같은 호스트 Docker 데몬에서 실행. 컨테이너 안에서는 `/var/run/docker.sock` 마운트 + named volume `lean-workflows`를 `/workspace`로 공유(docker-compose.yml에 설정됨). docker CLI가 없으면 Engine API(소켓)로 실행 | stock-coin-trade `ai_sheet.py` |
+| `ssh` | `LEAN_SSH_HOST`로 scp 후 원격에서 `docker run` | domain-rag-lab |
+| `local` | LEAN 미실행, pandas 지표만 | — |
+| `auto` (기본) | ssh 설정 → docker 가용 → local 순서로 자동 선택 | — |
+
+```bash
+docker pull quantconnect/lean:latest   # docker 모드 사전 준비 (약 14GB)
 ```
 
-### CI/CD (GitHub Actions 예시)
-
-```yaml
-- name: Build & push to ECR
-  run: |
-    docker build -t $ECR_REPO:$GITHUB_SHA .
-    docker push $ECR_REPO:$GITHUB_SHA
-- name: Deploy to ECS
-  run: aws ecs update-service --cluster fin-ai --service app --force-new-deployment
-```
+실행 이력은 `lean_backtest_runs` 테이블에 남고 `GET /api/backtests/lean/history`로 조회한다.
 
 ---
 
