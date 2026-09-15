@@ -1,0 +1,41 @@
+fastapi>=0.115.0
+python-jose[cryptography]>=3.3.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.20
+httpx>=0.27.0
+redis[asyncio]>=5.2.0
+boto3>=1.35.0  # Comprehend 감성분석 / SageMaker 학습 결과(S3) 조회
+sqlalchemy[asyncio]>=2.0.36
+asyncpg>=0.30.0
+alembic>=1.14.0
+bcrypt>=4.2.0
+python-dotenv>=1.0.1
+pydantic[email]>=2.10.0
+pydantic-settings>=2.7.0
+qdrant-client>=1.12.0
+beautifulsoup4>=4.12.0
+pandas>=2.0.0
+numpy>=1.26.0
+lightgbm>=4.3.0
+scikit-learn>=1.4.0
+
+# LangChain / LangGraph
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-community>=0.3.0
+langchain-ollama>=0.2.0
+langchain-qdrant>=0.2.0
+langgraph>=0.2.0
+
+# Neo4j
+neo4j>=5.14.0
+
+# Celery (비동기 태스크 큐 – broker/backend: Redis)
+celery[redis]>=5.4.0
+
+# Document parsing (PPT, DOC, XLS, PDF)
+python-pptx>=1.0.0
+python-docx>=1.1.0
+openpyxl>=3.1.0
+pdfplumber>=0.11.0
+Pillow>=10.0.0

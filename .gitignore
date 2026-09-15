@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment
+.env
+.env.dev
+.env.local
+
+# Data (large CSV files)
+data/09*/
+data/10*/
+data/12*/
+data/1*/
+data/app.db
+data/vectors-cache.json
+
+# OS
+.DS_Store
+.Identifier
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Misc
+.codex
+.clude
+*.pem
+
+aws-work/aws-icons
+aws-work/aws-icons.zip
+
+*.key

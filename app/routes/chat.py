@@ -1,0 +1,221 @@
+"""채팅 API – 대화 스레드 + Redis 사용자 상태 연동.
+
+변경 사항:
+- conversation_id 필드 추가: 없으면 자동으로 새 스레드 생성
+- Redis user_state 에 활성 conversation_id 기록
+- 메시지 저장 시 conversation_id 포함
+- 대화 스레드 updated_at / message_count 갱신
+- JWT Bearer 또는 쿠키 세션 모두 허용 (get_current_user_any)
+"""
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import settings
+from app.database.postgres import get_pg_session
+from app.models import Chat, Conversation
+from app.lib.jwt_auth import get_current_user_any
+from app.lib.llm_client import get_llm_client
+from app.lib.user_state import get_active_conversation, set_active_conversation
+from app.services.langgraph_agent import run_agent
+from app.services.rag_pipeline import rag_search
+
+router = APIRouter(prefix="/api")
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class ChatBody(BaseModel):
+    question: str
+    history: list[dict] = []
+    use_rag: bool = True
+    conversation_id: Optional[str] = None  # 없으면 자동 생성
+
+
+async def _get_or_create_conversation(db: AsyncSession, user_id: str, cid: Optional[str]) -> str:
+    """conversation_id 가 주어지면 검증, 없으면 Redis 활성 스레드 또는 신규 생성."""
+    uid = uuid.UUID(user_id)
+    if cid:
+        try:
+            result = await db.execute(
+                select(Conversation).where(Conversation.id == uuid.UUID(cid), Conversation.user_id == uid)
+            )
+            conv = result.scalar_one_or_none()
+        except Exception:
+            conv = None
+        if not conv:
+            raise HTTPException(404, "대화 스레드를 찾을 수 없습니다.")
+        return cid
+
+    # Redis 에서 활성 스레드 확인
+    active = await get_active_conversation(user_id)
+    if active:
+        result = await db.execute(
+            select(Conversation).where(Conversation.id == uuid.UUID(active), Conversation.user_id == uid)
+        )
+        if result.scalar_one_or_none():
+            return active
+
+    # 새 스레드 생성
+    conv = Conversation(user_id=uid, title=f"대화 {_now()[:10]}", message_count=0)
+    db.add(conv)
+    await db.commit()
+    await db.refresh(conv)
+    new_cid = str(conv.id)
+    await set_active_conversation(user_id, new_cid)
+    return new_cid
+
+
+async def _build_history_from_db(db: AsyncSession, conversation_id: str, user_id: str, limit: int = 10) -> list[dict]:
+    """PostgreSQL 에서 최근 대화 이력을 LangGraph 포맷으로 변환합니다."""
+    result = await db.execute(
+        select(Chat)
+        .where(Chat.conversation_id == uuid.UUID(conversation_id), Chat.user_id == uuid.UUID(user_id))
+        .order_by(Chat.created_at.desc())
+        .limit(limit)
+    )
+    docs = list(result.scalars().all())
+    docs.reverse()
+
+    history = []
+    for doc in docs:
+        history.append({"role": "user", "content": doc.question})
+        history.append({"role": "assistant", "content": doc.answer})
+    return history
+
+
+@router.post("/chat")
+async def chat(
+    body: ChatBody,
+    user=Depends(get_current_user_any),
+    db: AsyncSession = Depends(get_pg_session),
+):
+    user_id = user["id"]
+    ollama = get_llm_client()
+
+    # 대화 스레드 확보
+    conversation_id = await _get_or_create_conversation(db, user_id, body.conversation_id)
+
+    # 클라이언트가 history 를 보내지 않았으면 DB 에서 최근 이력 로드
+    history = body.history
+    if not history:
+        history = await _build_history_from_db(db, conversation_id, user_id, limit=10)
+
+    # LangChain RAG 검색 (Qdrant)
+    rag_context = ""
+    if body.use_rag:
+        try:
+            docs = await rag_search(body.question, top_k=settings.TOP_K)
+            if docs:
+                rag_context = "\n\n".join(
+                    f"[{d['title']}] {d['text'][:500]}" for d in docs
+                )
+        except Exception:
+            pass
+
+    # LangGraph 에이전트 실행
+    try:
+        result = await run_agent(
+            db, ollama, settings.LLM_MODEL,
+            body.question, history,
+            rag_context=rag_context,
+        )
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise HTTPException(
+                503,
+                f"LLM 모델({settings.LLM_MODEL})을 찾을 수 없습니다. "
+                f"(ollama pull {settings.LLM_MODEL})",
+            )
+        raise HTTPException(503, f"Ollama 오류: {e.response.status_code}")
+    except httpx.ConnectError:
+        raise HTTPException(503, f"Ollama 서버({settings.OLLAMA_BASE_URL})에 연결할 수 없습니다.")
+    except httpx.TimeoutException:
+        raise HTTPException(504, "LLM 응답 시간이 초과되었습니다.")
+    except Exception as e:
+        raise HTTPException(500, f"에이전트 오류 (LLM_PROVIDER={settings.LLM_PROVIDER}): {str(e)[:200]}")
+
+    # PostgreSQL – 메시지 저장 (conversation_id 포함)
+    try:
+        db.add(Chat(
+            user_id=uuid.UUID(user_id),
+            client_id=user.get("client_id", ""),
+            conversation_id=uuid.UUID(conversation_id),
+            question=body.question,
+            answer=result["answer"],
+            steps=result.get("steps", []),
+            citations=result.get("citations", []),
+        ))
+        # 스레드 통계 갱신
+        conv_result = await db.execute(select(Conversation).where(Conversation.id == uuid.UUID(conversation_id)))
+        conv = conv_result.scalar_one_or_none()
+        if conv:
+            conv.message_count += 1
+        await db.commit()
+    except Exception:
+        await db.rollback()
+
+    # Redis 사용자 상태 갱신 (활성 대화 + 마지막 활동 시각)
+    try:
+        await set_active_conversation(user_id, conversation_id)
+    except Exception:
+        pass
+
+    return {**result, "conversation_id": conversation_id}
+
+
+# ── 비동기 채팅 (Celery) ──────────────────────────────────────────────────────
+
+@router.post("/chat/async", summary="비동기 채팅 (태스크 큐)")
+async def chat_async(
+    body: ChatBody,
+    user=Depends(get_current_user_any),
+    db: AsyncSession = Depends(get_pg_session),
+):
+    """에이전트 실행을 Celery 워커에 위임하고 task_id 를 즉시 반환한다.
+
+    클라이언트는 GET /api/tasks/{task_id} 를 폴링하여 결과를 확인한다.
+    LLM 응답 대기(최대 수 분)가 HTTP 타임아웃을 유발하는 상황에 사용한다.
+    """
+    from app.tasks.agent_tasks import run_agent_task
+
+    user_id = user["id"]
+    conversation_id = await _get_or_create_conversation(db, user_id, body.conversation_id)
+
+    history = body.history
+    if not history:
+        history = await _build_history_from_db(db, conversation_id, user_id, limit=10)
+
+    rag_context = ""
+    if body.use_rag:
+        try:
+            docs = await rag_search(body.question, top_k=settings.TOP_K)
+            if docs:
+                rag_context = "\n\n".join(
+                    f"[{d['title']}] {d['text'][:500]}" for d in docs
+                )
+        except Exception:
+            pass
+
+    task = run_agent_task.delay(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        question=body.question,
+        history=history,
+        llm_model=settings.LLM_MODEL,
+        rag_context=rag_context,
+    )
+
+    return {
+        "task_id": task.id,
+        "conversation_id": conversation_id,
+        "poll_url": f"/api/tasks/{task.id}",
+    }
