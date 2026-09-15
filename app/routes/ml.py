@@ -14,6 +14,7 @@ from app.services.ml_models import (
 )
 from app.services.investment_research import optimize_portfolio, ai_predict_return
 from app.services.data_cache import cache_get, cache_set
+from app.services.quant_ai_scores import get_batch_training_scores
 
 router = APIRouter(prefix="/api/ml")
 
@@ -116,6 +117,7 @@ async def robo_allocation(
     # 예측 수익률(Ridge 회귀, 피처 엔지니어링)을 함께 스코어링한다.
     # 화면에 뜨는 종목은 고정되어 있지 않고 매 요청마다 이 스캔 결과로 결정된다.
     sem = asyncio.Semaphore(8)
+    batch_scores = await get_batch_training_scores()  # SageMaker 일 1회 배치 학습 (없으면 None)
 
     async def _screen(s: dict) -> dict | None:
         async with sem:
@@ -142,6 +144,9 @@ async def robo_allocation(
             if ai is not None:
                 await cache_set(cache_key, ai)
 
+        code6 = s["symbol"].split(".")[0]
+        sentiment = await cache_get(f"sentiment:{code6}", max_age_hours=72)
+        batch = (batch_scores or {}).get("scores", {}).get(s["symbol"])
         return {
             "symbol": s["symbol"],
             "name": s["name"],
@@ -151,6 +156,8 @@ async def robo_allocation(
             "ann_vol_pct": round(ann_vol * 100, 2),
             "sharpe": sharpe,
             "ai": ai,
+            "sentiment": sentiment,
+            "batch": batch,
         }
 
     screened = await asyncio.gather(*(_screen(s) for s in QUANT_STOCKS))
@@ -198,6 +205,20 @@ async def robo_allocation(
     )
     if ai_component:
         weighted_components.append(ai_component)
+    batch_component = _confidence_weighted_component(
+        [p["batch"]["pred_ann_return_pct"] if p["batch"] else None for p in picks],
+        [p["batch"].get("confidence") if p["batch"] else None for p in picks],
+        default_confidence=0.6,
+    )
+    if batch_component:
+        weighted_components.append(batch_component)
+    sentiment_component = _confidence_weighted_component(
+        [p["sentiment"]["score"] if p["sentiment"] else None for p in picks],
+        [None for _ in picks],  # 감성분석엔 자체 신뢰도 개념이 없어 고정 가중치 사용
+        default_confidence=0.4,
+    )
+    if sentiment_component:
+        weighted_components.append(sentiment_component)
 
     # 샤프비율(과거 실측치)은 항상 가중치 1.0으로 포함하고, 나머지는 종목별 confidence로 가중 평균
     for i, p in enumerate(picks):
@@ -229,6 +250,11 @@ async def robo_allocation(
         if p["ai"]:
             sig = signal_labels.get(p["ai"].get("signal"), "")
             notes.append(f"AI 예측 수익률 {p['ai']['pred_ann_return_pct']}% ({sig}, 신뢰도 {p['ai']['confidence']:.2f})")
+        if p["batch"]:
+            sig = signal_labels.get(p["batch"].get("latest_signal"), "")
+            notes.append(f"배치학습 예측 {p['batch']['pred_ann_return_pct']}% ({sig}, 신뢰도 {p['batch'].get('confidence', 0):.2f})")
+        if p["sentiment"]:
+            notes.append(f"뉴스 감성 {p['sentiment']['score']:+.2f}")
         note_text = (", " + ", ".join(notes)) if notes else ""
         stock_picks.append({
             "name": p["name"],
@@ -237,6 +263,8 @@ async def robo_allocation(
             "weight": w,
             "reason": f"연환산 수익률 {p['ann_return_pct']}%, 변동성 {p['ann_vol_pct']}%{note_text}",
             "ai_prediction": p["ai"],
+            "batch_training": p["batch"],
+            "news_sentiment": p["sentiment"],
         })
 
     # 최적화된 주식 바스켓의 과거 기대수익률을 전체 자산배분 비중에 반영

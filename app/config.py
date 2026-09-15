@@ -25,10 +25,16 @@ class Settings(BaseSettings):
     OLLAMA_TIMEOUT: float = 300.0
 
     # ── LLM 서빙 백엔드 선택 (채팅/에이전트 전용, 임베딩은 항상 Ollama 사용) ─────
-    # ollama(기본, 로컬 Ollama) | vllm
+    # ollama(기본, 로컬/EC2 Ollama) | bedrock | sagemaker | vllm
     LLM_PROVIDER: str = "ollama"
 
-    # vLLM 서버 (OpenAI 호환 /v1/chat/completions)
+    # Bedrock (converse API 사용, AWS_REGION 재사용)
+    BEDROCK_MODEL_ID: str = ""  # 예: us-east-1의 meta.llama3-1-8b-instruct-v1:0
+
+    # SageMaker JumpStart 엔드포인트 (invoke_endpoint)
+    SAGEMAKER_ENDPOINT_NAME: str = ""
+
+    # EC2/ECS 위의 vLLM (OpenAI 호환 /v1/chat/completions)
     VLLM_BASE_URL: str = ""
     VLLM_MODEL: str = ""
 
@@ -44,32 +50,9 @@ class Settings(BaseSettings):
     NEO4J_USER: str = "neo4j"
     NEO4J_PASSWORD: str = "finagent123"
 
-    # ── QuantConnect LEAN 백테스트 (domain-rag-lab / stock-coin-trade 이식) ──────
-    # auto | ssh | docker | local  (auto: SSH 설정 있으면 ssh → docker CLI 있으면 docker → local)
-    LEAN_MODE: str = "auto"
-    LEAN_DOCKER_IMAGE: str = "quantconnect/lean:latest"
-    LEAN_TIMEOUT_SECONDS: int = 300
-    LEAN_KEEP_WORKDIR: bool = False           # 디버깅용: 실행 폴더(main.py/prices.csv/results) 보존
-    # docker 모드: 이 프로세스가 쓰는 작업 폴더. 컨테이너 안에서 실행하면 같은 경로가 호스트에서
-    # LEAN_HOST_WORKDIR로 보이도록 volume을 맞춰야 한다 (docker-compose.yml 참고).
-    LEAN_WORKDIR: str = "./data/lean-workflows"
-    LEAN_HOST_WORKDIR: str = ""
-    # docker 모드에서 LEAN_WORKDIR 대신 named volume 이름을 마운트 (컨테이너 안에서 실행할 때 권장)
-    LEAN_DOCKER_VOLUME: str = ""
-    DOCKER_SOCK: str = "/var/run/docker.sock"
-    # ssh 모드: 원격 LEAN 실행 서버 (PEM 키는 저장소에 넣지 말고 읽기 전용으로 마운트)
-    LEAN_SSH_HOST: str = ""
-    LEAN_SSH_USER: str = "ubuntu"
-    LEAN_SSH_KEY_PATH: str = ""
-    LEAN_REMOTE_WORKDIR: str = "/home/ubuntu/lean-workflows"
-
-    # ── Alpaca Paper Trading (읽기 전용 연결 테스트 + 퀀트 파이프라인 주문) ─────
-    ALPACA_API_KEY: str = ""
-    ALPACA_SECRET_KEY: str = ""
-
-    # ── 외부 Open API (/openapi/v1) 호출 제한 ────────────────────────────────
-    OPENAPI_RATE_LIMIT_MAX: int = 60       # 키당 분당 호출 수
-    OPENAPI_RATE_LIMIT_WINDOW: int = 60    # 초
+    # ── AWS (Comprehend 감성분석 / SageMaker 배치 학습 결과 조회) ──────────────
+    AWS_REGION: str = "ap-northeast-2"  # 실제 운영 EC2(fund-web)가 있는 리전
+    ML_ARTIFACTS_BUCKET: str = ""  # SageMaker 학습 산출물(scores.json)이 저장된 S3 버킷
 
     ADMIN_EMAILS: str = ""
     TRUST_PROXY: bool = False
