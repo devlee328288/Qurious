@@ -385,6 +385,35 @@ docker stop qurious-redis-test && docker rm qurious-redis-test   # ★ 끝나면
 고친 방법은 `Celery(include=[...])` 로 **모듈을 직접 적는 것**이다. 고친 뒤 `[tasks]` 에
 **10개**가 전부 올라왔다(기존 7 + 수집기 3).
 
+### ⚠️ 그런데 버그가 하나 더 겹쳐 있었다
+
+등록을 고쳐도 기존 Beat 작업 2개는 여전히 안 돈다. **Beat 가 부르는 이름이 등록 이름과
+다르기 때문**이다.
+
+```python
+"task": "app.tasks.sync_tasks.sync_market_data"   # 모듈 경로 (틀림)
+#        실제 등록 이름은 @celery_app.task(name="sync.market_data")
+```
+
+이름이 어긋나면 Beat 가 쏜 메시지를 워커가 모르는 태스크로 보고 버린다. [A4 #23] 이
+*"Celery Beat 태스크 2개가 한 번도 실행된 적 없음"* 으로 지적한 그 결함이고, 위의 include
+문제와는 **별개의 버그**다. 하나만 고쳐서는 여전히 안 돈다.
+
+둘 다 고친 뒤:
+
+| Beat 항목 | 부르는 이름 | 도달? |
+|---|---|---|
+| `sync-market-data-hourly` | `sync.market_data` | ✅ |
+| `sync-candles-daily` | `sync.stock_candles` | ✅ |
+| `collector-portal-recent` | `collector.portal_recent` | ✅ |
+| `collector-rebuild-adjusted` | `collector.rebuild_adjusted` | ✅ |
+| `collector-write-manifest` | `collector.write_manifest` | ✅ |
+
+**불일치 0건.** 다만 `sync.*` 두 개는 **이름만 맞췄고 실행하지는 않았다** — 그 경로가
+A4 가 문제 삼은 Yahoo 비공식 API 를 타기 때문이다. 실행은 그 소스 판단이 끝난 뒤에 한다.
+
+[A4 #23]: https://github.com/devlee328288/Qurious/issues/23
+
 > 같은 함정을 한 번 더 겪었다: 첫 워커를 `pkill` 로 죽였다고 생각했는데 Windows 에서는
 > 안 죽어, 구·신 워커가 같은 큐를 나눠 먹으며 3건 중 1건만 성공했다. `Get-CimInstance`
 > 로 확인해 확실히 종료한 뒤에야 3/3 이 됐다.
