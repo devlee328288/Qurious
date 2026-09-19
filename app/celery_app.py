@@ -49,13 +49,22 @@ celery_app.conf.update(
 
     # ── Celery Beat 주기 스케줄 ────────────────────────────────────────────────
     beat_schedule={
+        # ⚠️ 부르는 이름은 **등록 이름**이어야 한다. 모듈 경로가 아니다.
+        #
+        # 원래 "app.tasks.sync_tasks.sync_market_data" 였는데, 그 태스크의 실제 등록
+        # 이름은 @celery_app.task(name="sync.market_data") 로 지정된 "sync.market_data"
+        # 다. 이름이 어긋나면 Beat 가 쏜 메시지를 워커가 모르는 태스크로 보고 버린다.
+        # A4(#23)가 "Beat 태스크 2개가 한 번도 실행된 적 없음" 으로 지적한 그 결함이다.
+        #
+        # 위쪽 include 문제(태스크가 아예 등록조차 안 되던 것)와는 **별개의 버그**라,
+        # 하나만 고쳐서는 여전히 안 돈다. 둘 다 고쳐야 한다.
         "sync-market-data-hourly": {
-            "task": "app.tasks.sync_tasks.sync_market_data",
+            "task": "sync.market_data",
             "schedule": 3600.0,           # 1시간
             "options": {"expires": 3500},
         },
         "sync-candles-daily": {
-            "task": "app.tasks.sync_tasks.sync_stock_candles",
+            "task": "sync.stock_candles",
             "schedule": 86400.0,          # 24시간
             "options": {"expires": 82800},
         },
