@@ -237,7 +237,7 @@ def run_reparse(*, quiet: bool = False) -> Dict[str, int]:
     conn = db.connect()
     cal = dart.trading_days(conn)
     rows = conn.execute(
-        "SELECT srtn_cd, rcept_no, corp_code, itms_nm, report_nm FROM dividend "
+        "SELECT srtn_cd, record_dt, rcept_no, corp_code, itms_nm, report_nm FROM dividend "
         "WHERE rcept_no <> '' ORDER BY rcept_no").fetchall()
     tally = {"read": 0, "missing_raw": 0, "saved": 0, "review": 0,
              "dropped": 0, "pruned": 0, "out_of_range": 0}
