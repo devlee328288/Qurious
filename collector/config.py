@@ -153,6 +153,45 @@ def kis_credentials(paper: bool = True) -> tuple[str, str, str]:
     )
 
 
+# ==================================================
+# 4. 전자공시(DART) — 배당
+# ==================================================
+DART_LIST_URL = "https://opendart.fss.or.kr/api/list.json"
+DART_DOC_URL = "https://opendart.fss.or.kr/api/document.xml"
+DART_ALOT_URL = "https://opendart.fss.or.kr/api/alotMatter.json"
+DART_CORP_CODE_URL = "https://opendart.fss.or.kr/api/corpCode.xml"
+
+#: 종목코드(6자리) → [corp_code(8자리), 회사명] 매핑. `corpCode.xml` 을 한 번 받아 만든다.
+#: 3,990사 확보(2026-09-19). 원자료라 `.gitignore` 안에 있다.
+DART_CORP_CODE_PATH = DATA_DIR / "dart_corp_code.json"
+
+#: DART 호출 간격(초).
+#:
+#: ⚠️ DART 는 **남은 유량을 헤더로 알려 주지 않는다** — 포털의 `X-RateLimit-Remaining`
+#:    같은 것이 없다. 그래서 `RateLimiter.remaining` 은 끝까지 None 으로 남고
+#:    `check_budget()` 이 아무 일도 하지 않는다. 한도 관리는 **부르는 쪽이 호출 수를
+#:    세서** 한다(sources/dart.py 의 `max_calls`).
+DART_SLEEP = 0.25
+
+#: 하루 호출 한도. DART 개발가이드가 게시한 값(일반 사용자 20,000건/일).
+#: 포털과 달리 실측으로 확인할 방법이 없다 — 헤더가 없으므로, 넘기면 `status=020` 으로
+#: 알게 된다. 그래서 수집기는 이 값에 **여유를 두고** 스스로 멈춘다.
+DART_DAILY_LIMIT = 20_000
+
+#: 한 번 실행에서 쓰지 않고 남겨 둘 몫. 사람이 확인 호출을 해 볼 여유다.
+DART_RESERVE = 1_000
+
+
+def dart_key() -> str:
+    """DART 인증키.
+
+    ⚠️ 포털 키와 달리 **unquote 하지 않는다.** DART 키는 40자 16진수라 퍼센트 인코딩될
+       문자가 애초에 없다. 습관적으로 unquote 를 붙이면 `%` 를 포함한 키가 왔을 때만
+       조용히 망가지는, 재현이 어려운 버그가 된다.
+    """
+    return require("DART_API_KEY", "전자공시(DART) 인증키")
+
+
 def ensure_dirs() -> None:
     for d in (DATA_DIR, MANIFEST_DIR, STATE_DIR):
         d.mkdir(parents=True, exist_ok=True)

@@ -9,11 +9,22 @@
 옮겨 갈 때를 대비해 표 모양은 Postgres 로 그대로 번역되게 잡아 두었다 — 특수 타입을
 쓰지 않고, 기본키를 자연키로 잡았다. 옮기는 일은 적재가 안정된 뒤에 한다.
 
-표 셋
------
-``raw_response``   응답 원문. 정규화를 다시 돌릴 수 있는 **유일한** 근거.
-``price_daily``    정규화한 일별 시세. 분석이 읽는 표.
-``ingest_day``     기준일별 수집 상태. 중단한 자리에서 다시 시작하는 근거.
+표 여섯
+-------
+받은 것 (출처가 준 값 그대로) ::
+
+    raw_response      응답 원문. 정규화를 다시 돌릴 수 있는 **유일한** 근거.
+    price_daily       정규화한 일별 시세. 분석이 읽는 표.
+    dividend          배당 공시에서 읽은 사실. 현금배당은 시세 표에 안 나타난다.
+    ingest_day        수집 상태. 중단한 자리에서 다시 시작하는 근거.
+
+계산한 것 (언제든 지우고 다시 만든다) ::
+
+    price_adjusted    수정주가. preprocess 가 만든다.
+    corporate_action  가격이 끊긴 날과 그 계수.
+
+**받은 것과 계산한 것을 섞지 않는다.** 계산 규칙은 바뀌고, 바뀌면 전부 다시 만들어야
+하는데 원본에 덮어써 두면 되돌릴 근거가 없어진다.
 """
 
 from __future__ import annotations
@@ -128,6 +139,43 @@ CREATE TABLE IF NOT EXISTS corporate_action (
     kind        TEXT    NOT NULL DEFAULT 'review',
     PRIMARY KEY (bas_dt, srtn_cd)
 );
+
+-- ── 6. 배당 ─────────────────────────────────────────────────────────────────
+-- 출처는 DART 「현금ㆍ현물배당결정」 공시 본문이다(sources/dart.py).
+--
+-- 왜 price_daily 와 따로 두나: 현금배당은 거래소가 기준가를 조정하지 않으므로
+-- 시세 표의 어느 칸에도 나타나지 않는다. 가격에 섞을 수 있는 값이 아니라 수익률에
+-- **더하는** 값이라, 표를 따로 둔다. 수정주가(price_adjusted)와 합쳐 TR 을 만든다.
+--
+-- 기본키를 (종목, 배당기준일)로 잡은 이유: 한 종목이 같은 기준일에 두 번 배당하는 일은
+-- 없다. 정정공시는 접수번호만 달라지므로 '나중 접수번호가 이긴다' 로 처리한다
+-- (sources/dart.py 의 upsert).
+CREATE TABLE IF NOT EXISTS dividend (
+    srtn_cd     TEXT    NOT NULL,          -- 단축코드 6자리
+    record_dt   TEXT    NOT NULL,          -- 배당기준일 YYYYMMDD (공시에 적힌 값)
+    rcept_no    TEXT    NOT NULL DEFAULT '',   -- 공시 접수번호. 원문 추적 키
+    corp_code   TEXT    NOT NULL DEFAULT '',   -- DART 기업 고유번호 8자리
+    itms_nm     TEXT    NOT NULL DEFAULT '',
+    report_nm   TEXT    NOT NULL DEFAULT '',   -- 공시 제목. 정정공시 여부가 여기 보인다
+    div_kind    TEXT    NOT NULL DEFAULT '',   -- 결산배당 | 분기배당 | 중간배당
+    div_type    TEXT    NOT NULL DEFAULT '',   -- 현금배당 | 현물배당
+    dps         REAL,                      -- 1주당 배당금(원) 보통주식
+    dps_pref    REAL,                      -- 1주당 배당금(원) 종류주식(우선주)
+    yield_pct   REAL,                      -- 시가배당율(%). 검증용 — 주가와 대조하면 맞는다
+    total_amt   INTEGER,                   -- 배당금총액(원)
+    -- 배당락일. 기준일에서 **거래일 달력으로** 역산한 값이다(sources/dart.py 머리말).
+    -- 공시에 적힌 값이 아니라 우리가 계산한 값이므로, 규칙이 바뀌면 다시 계산한다.
+    ex_div_dt   TEXT    NOT NULL DEFAULT '',
+    board_dt    TEXT    NOT NULL DEFAULT '',   -- 이사회결의일(결정일)
+    raw_sha256  TEXT    NOT NULL DEFAULT '',   -- 이 행이 나온 공시 본문 원문
+    -- 본문에서 필요한 칸을 못 읽었다. 추측해서 채우지 않고 여기에 표시만 한다 —
+    -- 조용히 0원으로 담기면 백테스트가 조용히 틀린다.
+    needs_review INTEGER NOT NULL DEFAULT 0,
+    note        TEXT    NOT NULL DEFAULT '',
+    PRIMARY KEY (srtn_cd, record_dt)
+);
+CREATE INDEX IF NOT EXISTS ix_div_exdt ON dividend(ex_div_dt);
+CREATE INDEX IF NOT EXISTS ix_div_review ON dividend(needs_review);
 """
 
 
