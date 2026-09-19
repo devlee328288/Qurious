@@ -104,7 +104,14 @@ DIVIDEND_KEYWORD = "배당"
 #: ``주주명부폐쇄``  「현금ㆍ현물배당을위한주주명부폐쇄(기준일)결정」 은 기준일만 정하는
 #:   공시로 **배당금이 안 적혀 있다.** 금액은 나중에 「현금ㆍ현물배당결정」 으로 나온다.
 #:   🟡 기준일 교차검증에는 쓸 수 있어, 버리지 말고 세어서 보고만 한다.
-DIVIDEND_EXCLUDE = ("자회사", "종속회사", "주주명부폐쇄")
+#:
+#: ``주식배당``  「주식배당결정」 은 **현금이 아니라 주식**을 준다. 이 표에 넣으면 안 되는
+#:   이유가 둘이다. ① 서식이 달라 "1주당 배당금(원)" 칸이 없다(실측 24건 전부 금액 미검출).
+#:   ② **거래소가 배당락일에 기준가를 조정한다** — 주식수가 늘기 때문이다. 그래서 이미
+#:   `vs` 를 통해 `corporate_action` 표에 잡혀 있고, 여기에 또 담으면 **이중 계상**이다.
+#:   🟢 실측으로 확인했다: 기준일 2020-12-31 주식배당 공시 22종목이 **22/22 전부**
+#:      우리가 역산한 배당락일 `20201229` 에 `corporate_action` 에 들어 있었다.
+DIVIDEND_EXCLUDE = ("자회사", "종속회사", "주주명부폐쇄", "주식배당")
 
 #: 본문에서 **정정신고 블록이 끝나고 실제 서식이 시작되는 자리**를 찾는 표시.
 #:
@@ -175,13 +182,28 @@ class ScanResult:
     dividend_reports: int = 0     # 본문을 받을 대상
     rows: List[Dict] = field(default_factory=list)
     excluded: List[Dict] = field(default_factory=list)  # 제목에 '배당'은 있으나 제외된 것
+    #: 제외 사유별 건수. "무엇을 왜 버렸나" 를 보고에 남기려고 센다.
+    excluded_by: Dict[str, int] = field(default_factory=dict)
+
+
+def exclude_reason(report_nm: str) -> str:
+    """제목만 보고 제외 사유를 돌려준다. 받아야 할 공시면 빈 문자열.
+
+    사유를 **이름으로** 돌려주는 이유: 제외 건수만 세면 "무엇을 왜 버렸나" 가 사라진다.
+    특히 ``주식배당`` 은 버리는 게 아니라 **다른 표(`corporate_action`)가 이미 갖고 있는
+    것**이라, 그 구분이 보고에 남아야 한다.
+    """
+    if DIVIDEND_KEYWORD not in report_nm:
+        return "무관"
+    for x in DIVIDEND_EXCLUDE:
+        if x in report_nm:
+            return x
+    return ""
 
 
 def is_dividend_report(report_nm: str) -> bool:
     """제목만 보고 **본문을 받을지** 정한다. 제외 근거는 ``DIVIDEND_EXCLUDE`` 주석."""
-    if DIVIDEND_KEYWORD not in report_nm:
-        return False
-    return not any(x in report_nm for x in DIVIDEND_EXCLUDE)
+    return exclude_reason(report_nm) == ""
 
 
 # ==================================================
@@ -548,10 +570,13 @@ def scan_month(conn: sqlite3.Connection, limiter: RateLimiter, ym: str, *,
         if page == 1:
             res.total_reports = total
         for row in rows:
-            if is_dividend_report(row.get("report_nm") or ""):
+            why = exclude_reason(row.get("report_nm") or "")
+            if why == "":
                 res.rows.append(row)
-            elif DIVIDEND_KEYWORD in (row.get("report_nm") or ""):
-                res.excluded.append(row)   # 세어서 보고만 한다 (DIVIDEND_EXCLUDE 참고)
+            elif why != "무관":
+                # 세어서 보고만 한다 (DIVIDEND_EXCLUDE 참고)
+                res.excluded.append(row)
+                res.excluded_by[why] = res.excluded_by.get(why, 0) + 1
         if page >= max(total_page, 1):
             break
         page += 1

@@ -66,7 +66,7 @@ def process_month(conn: sqlite3.Connection, limiter: RateLimiter, ym: str, *,
     tally = {"list_calls": scan.list_calls, "reports": scan.total_reports,
              "candidates": len(scan.rows), "excluded": len(scan.excluded),
              "no_code": 0, "no_record_dt": 0, "subsidiary": 0, "no_file": 0,
-             "review": 0, "saved": 0}
+             "review": 0, "saved": 0, "out_of_range": 0}
 
     items: List[dart.Dividend] = []
     for row in scan.rows:
@@ -109,9 +109,14 @@ def process_month(conn: sqlite3.Connection, limiter: RateLimiter, ym: str, *,
         ex = dart.ex_dividend_date(cal, d.record_dt)
         d.ex_div_dt = ex or ""
         if not ex:
-            d.needs_review = 1
+            # ⚠️ 이것은 **파싱 실패가 아니다.** 기준일이 우리 시세 구간(2020-01-02~) 앞이라
+            #    배당락일을 구할 거래일이 없는 것이다. 그런 배당은 배당락일이 이미 지나
+            #    있으므로 우리 백테스트 구간의 수익률에 더해서도 안 된다 — 제대로 비어야
+            #    하는 칸이다. `needs_review` 를 세우면 진짜 문제(금액을 못 읽음)가 이
+            #    1,000여 건에 묻힌다.
             d.note = (d.note + " / " if d.note else "") + \
-                     f"배당락일 미정 — 기준일 {d.record_dt} 이 거래일 달력 밖이다"
+                     f"배당락일 없음 — 기준일 {d.record_dt} 이 거래일 달력(2020-01-02~) 앞이다"
+            tally["out_of_range"] += 1
         if d.needs_review:
             tally["review"] += 1
         items.append(d)
@@ -125,7 +130,8 @@ def process_month(conn: sqlite3.Connection, limiter: RateLimiter, ym: str, *,
             f"저장 {tally['saved']}건 · 검토 {tally['review']}건 · "
             f"제목제외 {tally['excluded']}건 · 자회사 {tally['subsidiary']}건 · "
             f"코드없음 {tally['no_code']}건 · 기준일없음 {tally['no_record_dt']}건 · "
-            f"본문없음 {tally['no_file']}건")
+            f"본문없음 {tally['no_file']}건 · 구간밖 {tally['out_of_range']}건 · "
+            f"제외내역 {scan.excluded_by or '-'}")
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
@@ -138,7 +144,8 @@ def process_month(conn: sqlite3.Connection, limiter: RateLimiter, ym: str, *,
               + (f" · 자회사 {tally['subsidiary']}" if tally["subsidiary"] else "")
               + (f" · 코드없음 {tally['no_code']}" if tally["no_code"] else "")
               + (f" · 기준일없음 {tally['no_record_dt']}" if tally["no_record_dt"] else "")
-              + (f" · 본문없음 {tally['no_file']}" if tally["no_file"] else ""))
+              + (f" · 본문없음 {tally['no_file']}" if tally["no_file"] else "")
+              + (f" · 구간밖 {tally['out_of_range']}" if tally["out_of_range"] else ""))
     return tally
 
 
@@ -174,7 +181,8 @@ def run_scan(*, from_year: int = DEFAULT_FROM_YEAR, to_year: Optional[int] = Non
         todo = todo[:limit]
 
     total = {"months": 0, "saved": 0, "review": 0, "candidates": 0, "excluded": 0,
-             "subsidiary": 0, "no_code": 0, "no_record_dt": 0, "no_file": 0}
+             "subsidiary": 0, "no_code": 0, "no_record_dt": 0, "no_file": 0,
+             "out_of_range": 0}
     if not todo:
         print(f"훑을 달이 없다 — 대상 {len(wanted)}달이 모두 처리돼 있다.")
         conn.close()
@@ -198,14 +206,16 @@ def run_scan(*, from_year: int = DEFAULT_FROM_YEAR, to_year: Optional[int] = Non
             break
         total["months"] += 1
         for k in ("saved", "review", "candidates", "excluded",
-                  "subsidiary", "no_code", "no_record_dt", "no_file"):
+                  "subsidiary", "no_code", "no_record_dt", "no_file",
+                  "out_of_range"):
             total[k] += t[k]
 
     conn.close()
     print(f"\n훑은 달 {total['months']}달 · 저장 {total['saved']:,}건 "
           f"(검토필요 {total['review']:,}건) · 제목제외 {total['excluded']:,}건 · "
           f"자회사 {total['subsidiary']:,}건 · 코드없음 {total['no_code']:,}건 · "
-          f"기준일없음 {total['no_record_dt']:,}건 · 본문없음 {total['no_file']:,}건")
+          f"기준일없음 {total['no_record_dt']:,}건 · 본문없음 {total['no_file']:,}건 · "
+          f"구간밖 {total['out_of_range']:,}건")
     print(limiter.report())
     if stopped:
         print(f"\n중단됨:\n{stopped}")
@@ -223,9 +233,17 @@ def run_reparse(*, quiet: bool = False) -> Dict[str, int]:
     rows = conn.execute(
         "SELECT srtn_cd, rcept_no, corp_code, itms_nm, report_nm FROM dividend "
         "WHERE rcept_no <> '' ORDER BY rcept_no").fetchall()
-    tally = {"read": 0, "missing_raw": 0, "saved": 0, "review": 0, "dropped": 0}
+    tally = {"read": 0, "missing_raw": 0, "saved": 0, "review": 0,
+             "dropped": 0, "pruned": 0, "out_of_range": 0}
     items: List[dart.Dividend] = []
+    prune: List[Tuple[str, str]] = []
     for r in rows:
+        # 제외 규칙이 뒤에 바뀌면 이미 담긴 행이 남는다. 재파싱이 **스스로 치운다** —
+        # 안 그러면 '주식배당' 처럼 나중에 걸러낸 것이 표에 영원히 남는다.
+        if not dart.is_dividend_report(r["report_nm"] or ""):
+            prune.append((r["srtn_cd"], r["record_dt"]))
+            tally["pruned"] += 1
+            continue
         kept = raw_store.load(conn, "dart", f"dividend/{r['rcept_no']}")
         if not kept:
             tally["missing_raw"] += 1
@@ -239,12 +257,18 @@ def run_reparse(*, quiet: bool = False) -> Dict[str, int]:
             tally["dropped"] += 1
             continue
         d.ex_div_dt = dart.ex_dividend_date(cal, d.record_dt) or ""
+        if not d.ex_div_dt:
+            d.note = (d.note + " / " if d.note else "") +                      f"배당락일 없음 — 기준일 {d.record_dt} 이 거래일 달력(2020-01-02~) 앞이다"
+            tally["out_of_range"] += 1
         if d.needs_review:
             tally["review"] += 1
         items.append(d)
 
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if prune:
+            conn.executemany(
+                "DELETE FROM dividend WHERE srtn_cd=? AND record_dt=?", prune)
         tally["saved"] = dart.upsert(conn, items)
         conn.execute("COMMIT")
     except Exception:
@@ -254,6 +278,12 @@ def run_reparse(*, quiet: bool = False) -> Dict[str, int]:
     print(f"보존 원문 {tally['read']:,}건 재파싱 → 저장 {tally['saved']:,}건 "
           f"(검토필요 {tally['review']:,}건 · 기준일없음 {tally['dropped']:,}건 · "
           f"원문없음 {tally['missing_raw']:,}건)")
+    if tally["pruned"]:
+        print(f"  · 제외 규칙이 바뀌어 {tally['pruned']:,}건을 표에서 지웠다 "
+              "(원문은 raw_response 에 그대로 남는다)")
+    if tally["out_of_range"]:
+        print(f"  · 배당락일 없음 {tally['out_of_range']:,}건 — 기준일이 시세 구간 앞이다. "
+              "파싱 실패가 아니다")
     if tally["dropped"]:
         print("  ⚠️ 기준일을 못 읽은 건은 표에 담기지 않는다 — 이전 값이 남아 있을 수 있다.")
     return tally
@@ -272,6 +302,19 @@ def print_status() -> None:
         print("  아직 아무것도 훑지 않았다. `python -m collector.dividend scan` 으로 시작한다.")
     for r in rows:
         print(f"  {r['status']:<8} {r['n']:>4}달  {(r['r'] or 0):>8,}건")
+
+    # ⚠️ 덮어쓰기 감시. 기본키가 (종목, 기준일)이라 같은 짝에 공시가 둘 오면 하나가
+    #    사라진다. 정정공시라면 그게 맞다(나중 접수번호가 이긴다). 그런데 **종류가 다른**
+    #    공시가 같은 짝을 쓰면 멀쩡한 배당이 지워진다 — 실제로 「주식배당결정」이
+    #    「현금ㆍ현물배당결정」에 덮여 사라지는 것을 봤고, 그래서 주식배당을 제외했다.
+    #    수를 띄워 두는 것은 같은 일이 또 생기면 **눈에 띄게** 하려는 것이다.
+    ing = conn.execute("SELECT COALESCE(SUM(rows),0) FROM ingest_day "
+                       "WHERE source='dart_dividend'").fetchone()[0]
+    have = conn.execute("SELECT COUNT(*) FROM dividend").fetchone()[0]
+    if ing and ing != have:
+        print(f"\n  ⚠️ 달별 저장 합계 {ing:,}건 vs 표에 남은 행 {have:,}건 — "
+              f"{ing - have:,}건이 같은 (종목, 기준일)에 덮였다.")
+        print("     정정공시라면 정상이다. `report_nm` 에 [기재정정] 이 없는 짝이 있으면 확인한다.")
 
     s = conn.execute(
         "SELECT COUNT(*) n, COUNT(DISTINCT srtn_cd) c, MIN(record_dt) a, MAX(record_dt) b, "
