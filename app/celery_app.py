@@ -8,7 +8,24 @@ from celery import Celery
 from celery.schedules import crontab
 from app.config import settings
 
-celery_app = Celery("lumina-invest")
+# ⚠️ 태스크 모듈을 **명시적으로** 싣는다.
+#
+# 원래는 맨 아래 autodiscover_tasks(["app.tasks"]) 하나로 끝내려 했는데, 그 함수는
+# 기본적으로 각 패키지 아래의 `tasks` 라는 이름의 모듈(= app/tasks/tasks.py)을 찾는다.
+# 그런 파일이 없어서 **어떤 태스크도 등록되지 않았다.** 워커를 띄우면 [tasks] 목록이 빈
+# 채로 뜨고, 태스크를 보내면 NotRegistered 가 난다 (2026-09-19 Redis 컨테이너로 실측).
+#
+# 조용히 실패하는 종류라, 워커가 "ready" 라고 찍고 나서도 아무 일도 안 일어난다.
+# 모듈을 직접 적으면 그런 일이 없고, 새 태스크 파일을 만들 때 한 줄 추가하면 된다.
+celery_app = Celery(
+    "lumina-invest",
+    include=[
+        "app.tasks.agent_tasks",
+        "app.tasks.ingest_tasks",
+        "app.tasks.sync_tasks",
+        "app.tasks.collector_tasks",
+    ],
+)
 
 celery_app.conf.update(
     # ── 브로커 / 백엔드 ─────────────────────────────────────────────────────────
@@ -70,5 +87,6 @@ celery_app.conf.update(
     },
 )
 
-# tasks 패키지 자동 탐색
+# 위 include 가 실제 등록을 맡는다. autodiscover 는 앞으로 app/tasks/tasks.py 를 만들
+# 경우를 대비해 남겨 두지만, **여기에 의존하지 않는다** (위 주석 참고).
 celery_app.autodiscover_tasks(["app.tasks"])

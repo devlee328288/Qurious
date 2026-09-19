@@ -323,7 +323,7 @@ python -m collector.manifest verify                      # 디스크가 썩지 �
 | 🔴 | **배당이 안 들어 있다** — 이건 가격수익(PR)이지 총수익(TR)이 아니다 |
 | 🔴 | 포털 **오류 응답이 한도를 깎는지** 미확정 |
 | 🔴 | 상장폐지 종목의 **사유** 미확보 (KIND 필요) |
-| 🔴 | Celery Beat 어댑터는 **스택 환경에서 미검증** (로컬에 celery 미설치) |
+| 🟢 | Celery Beat 어댑터 **검증 완료** — Redis 컨테이너로 태스크 3/3 실행 성공 (§12) |
 
 ### 이 설계를 뒤집을 조건
 
@@ -351,3 +351,40 @@ python -m collector.manifest verify                      # 디스크가 썩지 �
 | `../app/tasks/collector_tasks.py` | 83 | Celery Beat 어댑터 (얇음) |
 
 `data/collector/` 는 `.gitignore` 에 있다 — **원자료는 커밋하지 않는다.**
+
+---
+
+## 12. Celery 경로 검증 — 그리고 찾은 기존 버그
+
+Redis 컨테이너(`redis:7-alpine`, 이미 보유)를 띄워 실제로 돌렸다.
+
+```bash
+docker run -d --name qurious-redis-test -p 6399:6379 redis:7-alpine
+REDIS_URL=redis://localhost:6399 python -m celery -A app.celery_app worker --pool=solo
+#   Windows 에서는 --pool=solo 가 필요하다. 기본 prefork 는 안 돈다
+docker stop qurious-redis-test && docker rm qurious-redis-test   # ★ 끝나면 반드시
+```
+
+| 태스크 | 결과 |
+|---|---|
+| `collector.write_manifest` | ✅ 기준일 36일 · 지문 `26688522…` |
+| `collector.rebuild_adjusted` | ✅ 종목 3,140 · 행 93,636 · 이벤트 2,378 |
+| `collector.portal_recent` | ✅ 최근 5일 확인, 빈 날 1일 재시도 |
+
+### ⚠️ 그 과정에서 기존 버그를 찾았다
+
+처음에는 **셋 다 `NotRegistered` 로 실패**했다. 워커의 `[tasks]` 목록이 **비어 있었다.**
+
+원인은 `app/celery_app.py` 의 `autodiscover_tasks(["app.tasks"])` 다. 이 함수는 기본적으로
+각 패키지 아래 **`tasks` 라는 이름의 모듈**(= `app/tasks/tasks.py`)을 찾는데, 그런 파일이
+없다. 그래서 **기존 태스크 7개도 하나도 등록되지 않고 있었다** — `ingest.*` 4개,
+`sync.*` 2개, `agent.run` 전부.
+
+조용히 실패하는 종류다. 워커는 `ready` 라고 찍고 정상처럼 떠 있는데 아무 일도 안 일어난다.
+
+고친 방법은 `Celery(include=[...])` 로 **모듈을 직접 적는 것**이다. 고친 뒤 `[tasks]` 에
+**10개**가 전부 올라왔다(기존 7 + 수집기 3).
+
+> 같은 함정을 한 번 더 겪었다: 첫 워커를 `pkill` 로 죽였다고 생각했는데 Windows 에서는
+> 안 죽어, 구·신 워커가 같은 큐를 나눠 먹으며 3건 중 1건만 성공했다. `Get-CimInstance`
+> 로 확인해 확실히 종료한 뒤에야 3/3 이 됐다.
