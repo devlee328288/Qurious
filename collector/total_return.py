@@ -99,16 +99,91 @@ from collector import db
 #: 배당소득세율. 소득세 14% + 지방소득세 1.4% = 15.4% (원천징수)
 DIVIDEND_TAX_RATE = 0.154
 
-#: 계수가 이보다 크면 데이터 이상을 의심한다.
+#: 배당수익률이 이보다 크면 데이터 이상을 **의심**한다. 이것만으로 버리지는 않는다.
 #:
-#: 배당수익률 30% 는 현실에 있다(청산 배당·특별배당). 그러나 100% 를 넘으면 주가보다
-#: 배당금이 크다는 뜻이라, 공시 파싱이 틀렸거나 그 날 종가가 이상한 것이다.
-#: **자동으로 고치지 않고 표시만 한다** — preprocess 와 같은 원칙이다.
-DIV_FACTOR_SANITY = 2.0
+#: 실측 2026-09-19 (8,086건) — 높은 쪽 분포는 이렇다::
+#:
+#:     104.39%  KC그린홀딩스 009440  20221228   ← 아래 참고. 이 종목 배당이 아니다
+#:      24.59%  필옵틱스     161580  20231227   공시 시가배당율 21.3% 가 뒷받침한다
+#:      24.20%  락앤락       115390  20220929   공시 23.0%
+#:      23.17%  일성신약     003120  20221228   공시 22.2%
+#:
+#: **2위와 1위 사이가 네 배 넘게 벌어져 있다.** 20%대 고배당은 실재하므로 임계값을
+#: 50% 로 둔다 — 실측 2위(24.59%)의 두 배이고, 1위(104%)의 절반이다.
+DIV_YIELD_SANITY = 0.5
+
+#: 공시가 **스스로 적은** 시가배당율과 우리가 계산한 배당수익률의 비. 이 범위 밖이면
+#: 두 숫자가 서로를 뒷받침하지 않는다고 본다.
+#:
+#: 왜 이 검사가 필요한가 — 배당수익률이 크다는 것만으로는 **오류인지 진짜 고배당인지
+#: 구별할 수 없다.** 구별해 주는 두 번째 독립 신호가 공시 안에 있다: 「4. 시가배당율(%)」
+#: 은 회사가 직접 적은 값이고, 우리가 ``dps ÷ 종가`` 로 계산한 값과 맞아야 한다.
+#:
+#: 실측 2026-09-19 (시가배당율이 있는 8,033건) — 중앙값 **1.0111**::
+#:
+#:       5% 분위  0.9079        95% 분위  1.1024
+#:       1% 분위  0.7801        99% 분위  1.2379
+#:     0.1% 분위  0.5461      99.9% 분위  1.6000
+#:
+#: **[0.5, 2.0] 밖은 6건(0.07%)** 뿐이고, 그 6건은 전부 배당수익률이 3% 미만이라
+#: 아래 판정에 걸리지 않는다(시가배당율 쪽 오기로 보인다 — 성문전자·일정실업은 공시에
+#: 0.01% 로 적혀 있다).
+YIELD_CROSS_LO, YIELD_CROSS_HI = 0.5, 2.0
 
 
-def dividends_by_exdate(conn: sqlite3.Connection, code: str) -> Dict[str, float]:
-    """``배당락일 → 주당 배당금(원)``. 한 종목분.
+def is_implausible(dps: float, clpr: int, yield_pct: Optional[float]) -> Optional[str]:
+    """이 배당을 **적용하면 안 되는가.** 안 되면 이유를, 괜찮으면 ``None``.
+
+    판정은 **두 신호가 함께 어긋날 때만** 내린다 — `preprocess.classify` 와 같은
+    원칙이다. 배당수익률이 크다는 것만으로는 오류인지 진짜 고배당인지 구별되지 않고,
+    구별해 주는 두 번째 독립 신호가 공시 안에 있다(「4. 시가배당율(%)」).
+
+    실측으로 걸린 것은 딱 한 건이고, 그 한 건의 정체가 규칙을 설명한다.
+
+    **KC그린홀딩스 009440 · 배당락일 20221228 · 주당 2,949원 · 종가 2,825원**
+
+    수익률 104% 다. 그런데 이건 파싱 오류가 아니라 **이 종목의 배당이 아니다.**
+    공시 본문 「11. 기타 투자판단과 관련한 중요사항」이 그렇게 적고 있다::
+
+        1. 본 공시는 지주회사의 자회사에 대한 주요경영사항 신고입니다.
+           - 주요자회사명 : 케이씨환경서비스㈜ [비상장]
+        2. 상기 '4. 시가배당율(%)'은 비상장회사이므로 기재하지 않았습니다.
+        3. 발행주식총수는 보통주 1,373,130주 우선주 152,570주입니다.
+
+    총액이 이를 증명한다 — ``(1,373,130 + 152,570) × 2,949 = 4,499,289,300`` 으로
+    공시된 배당금총액과 **원 단위까지 일치**한다. 즉 2,949원은 비상장 자회사 주식
+    1주당 금액이고, KC그린홀딩스 주주는 이 돈을 받지 않는다.
+
+    ⚠️ **왜 기존 자회사 필터를 빠져나갔나** — 두 겹이 다 통과됐다.
+       ① 제목이 그냥 「현금ㆍ현물배당결정」이다. "(자회사의 주요경영사항)" 이 안 붙어
+          `DIVIDEND_EXCLUDE` 를 통과했다.
+       ② 자회사 표시가 **서식 머리행이 아니라 본문 11번 항목**에 있고, 문구도
+          "자회사**에 대한**" 이라 `_SUBSIDIARY_BODY` 의 "자회사**의** 주요경영사항"
+          정규식에 안 걸린다.
+       근본 해결은 `sources/dart.py` 쪽이다. 여기서는 **두 번째 방어선**을 둔다.
+
+    ★ 총액 대조를 **쓰지 않은 이유** — 실측해 보니 그쪽이 오히려 거짓 양성을 낸다.
+      ``총액 ÷ dps`` 를 상장주식수와 견주면 0.5 미만이 37건인데, 교보증권·대양제지처럼
+      **배당 자체는 멀쩡하고 총액 칸이 일부만 담긴** 경우가 대부분이었다. 총액으로
+      걸렀다면 정상 배당 36건을 버리고 009440 하나를 잡았을 것이다.
+    """
+    if clpr <= 0:
+        return None
+    y = dps / clpr
+    if y <= DIV_YIELD_SANITY:
+        return None                      # 신호 하나만으로는 판정하지 않는다
+    if yield_pct and yield_pct > 0:
+        cross = (y * 100.0) / yield_pct
+        if YIELD_CROSS_LO <= cross <= YIELD_CROSS_HI:
+            return None                  # 공시가 스스로 뒷받침한다 — 진짜 고배당이다
+        return (f"배당수익률 {y * 100:.1f}% 인데 공시 시가배당율은 {yield_pct}% 다 "
+                f"({cross:.1f}배 차이)")
+    return (f"배당수익률 {y * 100:.1f}% 인데 공시에 시가배당율이 없어 뒷받침되지 않는다 "
+            f"(자회사 배당을 모회사가 신고한 공시일 수 있다)")
+
+
+def dividends_by_exdate(conn: sqlite3.Connection, code: str) -> Dict[str, tuple]:
+    """``배당락일 → (주당 배당금(원), 시가배당율(%))``. 한 종목분.
 
     ★ 왜 단순 ``SUM`` 이 아닌가 — 정정공시가 **기준일을 바꿔** 올라오면 원본과 정정본이
     두 행으로 남는다. ``dividend`` 의 기본키가 (종목, 기준일)이기 때문이다. 실측 2건::
@@ -125,13 +200,13 @@ def dividends_by_exdate(conn: sqlite3.Connection, code: str) -> Dict[str, float]
     같은 기준일)는 이 규칙이 하나를 버린다. 실측에서는 그런 짝이 없었다 — 중복 2건은
     둘 다 정정공시 짝이었다. 새로 생기면 ``report_nm`` 이 다를 것이므로 거기서 보인다.
     """
-    out: Dict[str, float] = {}
+    out: Dict[str, tuple] = {}
     # ORDER BY rcept_no 로 오름차순 → dict 에 덮어쓰면 **가장 큰 접수번호가 남는다**
     for r in conn.execute(
-            "SELECT ex_div_dt, dps FROM dividend "
+            "SELECT ex_div_dt, dps, yield_pct FROM dividend "
             "WHERE srtn_cd=? AND ex_div_dt<>'' AND dps IS NOT NULL AND dps>0 "
             "ORDER BY ex_div_dt, rcept_no", (code,)):
-        out[r["ex_div_dt"]] = r["dps"]
+        out[r["ex_div_dt"]] = (r["dps"], r["yield_pct"])
     return out
 
 
@@ -169,7 +244,7 @@ def build(conn: sqlite3.Connection, codes: Optional[Iterable[str]] = None,
 
     tally = {"codes": 0, "rows": 0, "no_adjusted": 0,
              "div_applied": 0, "skipped_no_price": 0, "skipped_no_close": 0,
-             "suspect": 0}
+             "rejected": 0}
     conn.execute("BEGIN IMMEDIATE")
     try:
         for code in codes:
@@ -199,20 +274,26 @@ def build(conn: sqlite3.Connection, codes: Optional[Iterable[str]] = None,
                 if prev_adj and adj:
                     px = adj / prev_adj
 
-                dps = divs.get(r["bas_dt"])
+                hit = divs.get(r["bas_dt"])
+                dps = None
                 f_gross = f_net = 1.0
-                if dps:
+                if hit:
+                    d_val, y_pct = hit
                     if clpr and clpr > 0:
-                        # ★ 같은 날의 두 값을 나누므로 분할 조정과 무관하다 (머리말 참고)
-                        f_gross = 1.0 + dps / clpr
-                        f_net = 1.0 + dps * (1.0 - tax_rate) / clpr
-                        tally["div_applied"] += 1
-                        if f_gross > DIV_FACTOR_SANITY:
-                            tally["suspect"] += 1
+                        why = is_implausible(d_val, clpr, y_pct)
+                        if why:
+                            # 두 신호가 함께 어긋난다. **적용하지 않고 보고한다** —
+                            # 조용히 넣으면 그 종목 TR 이 통째로 틀린다.
+                            tally["rejected"] += 1
                             if verbose:
-                                print(f"  ⚠️ 배당 계수가 상식 밖이다 — {code} {r['bas_dt']} "
-                                      f"주당 {dps:,.0f}원 / 종가 {clpr:,}원 = "
-                                      f"{f_gross:.3f} (사람이 확인해야 한다)")
+                                print(f"  ⚠️ 배당을 적용하지 않았다 — {code} {r['bas_dt']} "
+                                      f"주당 {d_val:,.0f}원 / 종가 {clpr:,}원: {why}")
+                        else:
+                            dps = d_val
+                            # ★ 같은 날의 두 값을 나누므로 분할 조정과 무관하다 (머리말)
+                            f_gross = 1.0 + dps / clpr
+                            f_net = 1.0 + dps * (1.0 - tax_rate) / clpr
+                            tally["div_applied"] += 1
                     else:
                         # 거래정지 등으로 종가가 0·NULL 이면 재투자 가격을 정할 수 없다.
                         tally["skipped_no_close"] += 1
@@ -220,8 +301,7 @@ def build(conn: sqlite3.Connection, codes: Optional[Iterable[str]] = None,
                 pr *= px
                 tr *= px * f_gross
                 trn *= px * f_net
-                out.append((r["bas_dt"], code, tr, trn, pr, f_gross,
-                            dps if (dps and clpr and clpr > 0) else None))
+                out.append((r["bas_dt"], code, tr, trn, pr, f_gross, dps))
                 if adj:
                     prev_adj = adj
 
@@ -365,8 +445,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                       f"(상장 전이거나 거래가 없던 날)")
             if t["skipped_no_close"]:
                 print(f"  ⚠️ 종가가 없어 재투자 가격을 못 정한 배당 {t['skipped_no_close']:,}건")
-            if t["suspect"]:
-                print(f"  ⚠️ 배당 계수가 상식 밖인 건 {t['suspect']:,}건 (표시만 했다)")
+            if t["rejected"]:
+                print(f"  ⚠️ 두 신호가 어긋나 **적용하지 않은** 배당 {t['rejected']:,}건 "
+                      f"— 위 줄에 사유가 있다")
     finally:
         conn.close()
     return 0
