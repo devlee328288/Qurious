@@ -715,6 +715,34 @@ def annual_dps(rows: List[Dict], bsns_year: int) -> Dict[int, float]:
 # ==================================================
 # 7. 종목코드 매핑
 # ==================================================
+def annual_amounts(rows: List[Dict], bsns_year: int) -> Dict[int, float]:
+    """「현금배당금총액(백만원)」을 ``{연도: 백만원}`` 으로.
+
+    **왜 총액까지 읽나**: 주당배당금만으로는 사업보고서가 *어느 해 배당*을 적었는지
+    알 수 없다. 총액은 그 해에 단 하나뿐인 값이라 **지문 노릇**을 한다.
+
+    실제로 이것이 고려아연의 어긋남을 확정했다 — FY2020 사업보고서의 당기 총액
+    247,439백만원이 우리가 **기준일 2019-12-31** 공시 원문에서 읽은
+    247,439,360,000원과 같았다. 즉 그 보고서가 한 해 밀려 적힌 것이고, 우리 값이
+    틀린 것이 아니다. 주당배당금(14,000원)만 봤다면 어느 쪽이 맞는지 알 수 없었다.
+
+    단위 주의: 응답은 **백만원**, 우리 ``dividend.total_amt`` 는 **원**이다.
+    """
+    out: Dict[int, float] = {}
+    for it in rows:
+        if "현금배당금총액" not in (it.get("se") or "").replace(" ", ""):
+            continue
+        for key, back in (("thstrm", 0), ("frmtrm", 1), ("lwfr", 2)):
+            v = (it.get(key) or "").replace(",", "").strip()
+            if v in ("", "-", "\u2013", "\u2014"):
+                continue
+            try:
+                out[bsns_year - back] = float(v)
+            except ValueError:
+                pass
+    return out
+
+
 def corp_code_map() -> Dict[str, List[str]]:
     """종목코드(6자리) → ``[corp_code, 회사명]``.
 

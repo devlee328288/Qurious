@@ -313,6 +313,11 @@ def run_crosscheck(*, codes: Optional[List[str]] = None, limit: int = 12,
        ① 우리 수집 구간(2020-01~) **앞의 공시** — 2019년 분기배당은 2019년에 공시됐다
        ② 아직 안 훑은 달 — 예: 2023년 결산배당 공시는 **2024년 2~3월**에 나온다
        ③ 인적분할·합병이 끼면 주당 금액이 **비교 자체가 안 된다**
+       ④ 3월·6월 결산법인 — 아래 사업연도 매핑이 12월 결산을 가정한다
+
+    ★ ②는 "안 훑은 달" 만이 아니었다. 2023년 말 배당절차 개선으로 **결산배당의
+      기준일이 사업연도 밖(이듬해 2~4월)으로 나가는 회사**가 늘었다. 기준일 연도로
+      사업연도를 세면 그것만으로 어긋난다 — 코드가 아니라 집계 기준의 문제다.
     """
     conn = db.connect()
     limiter = _limiter()
@@ -325,7 +330,7 @@ def run_crosscheck(*, codes: Optional[List[str]] = None, limit: int = 12,
             "SELECT srtn_cd FROM dividend WHERE dps IS NOT NULL "
             "GROUP BY srtn_cd ORDER BY SUM(dps) DESC LIMIT ?", (limit,))]
 
-    tally = {"checked": 0, "agree": 0, "differ": 0, "missing": 0}
+    tally = {"checked": 0, "agree": 0, "differ": 0, "missing": 0, "shifted": 0}
     print(f"{'종목':<8}{'이름':<14}{'연도':<6}{'우리(합계)':>11}{'사업보고서':>11}{'차이':>10}")
     print("-" * 62)
     for code in codes:
@@ -336,20 +341,67 @@ def run_crosscheck(*, codes: Optional[List[str]] = None, limit: int = 12,
         row = conn.execute("SELECT itms_nm FROM price_daily WHERE srtn_cd=? LIMIT 1",
                            (code,)).fetchone()
         name = row[0] if row else ent[1]
+        # 사업연도 매핑. **기준일 연도가 곧 사업연도가 아니다.**
+        #
+        # 2023년 말 배당절차 개선(배당액을 먼저 정하고 기준일을 뒤에 두도록 한 것)
+        # 이후로, FY2023 결산배당의 기준일이 **2024-02-29** 인 사례가 흔하다
+        # (현대차 8,400원 · POSCO 2,500원 실측 · 둘 다 결의일은 2024-01). 기준일
+        # 연도로 세면 그 배당이 FY2024 로 잡혀 사업보고서와 어긋난다.
+        #
+        # 실측 추세 — 결산배당 중 기준일이 12-31 이 **아닌** 것의 비율:
+        #   2020~2023 약 2% → **2024 12%(128건)** → **2025 26%(293건)**
+        #   통념("12월 결산법인의 배당기준일은 12-31")이 깨지는 중이다.
+        #
+        # 주의: 12월 결산법인을 가정한다. 3월·6월 결산법인은 이 규칙으로 어긋난다.
         ours = {int(r[0]): r[1] for r in conn.execute(
-            "SELECT SUBSTR(record_dt,1,4) y, SUM(dps) FROM dividend "
-            "WHERE srtn_cd=? AND dps IS NOT NULL GROUP BY y", (code,))}
+            "SELECT CASE WHEN div_kind='결산배당' AND SUBSTR(record_dt,5,2) <= '06' "
+            "            THEN CAST(SUBSTR(record_dt,1,4) AS INTEGER) - 1 "
+            "            ELSE CAST(SUBSTR(record_dt,1,4) AS INTEGER) END AS fy, "
+            "       SUM(dps) FROM dividend "
+            "WHERE srtn_cd=? AND dps IS NOT NULL GROUP BY fy", (code,))}
+        # 총액(원). 사업연도 매핑은 위 ours 와 같은 규칙을 쓴다.
+        ours_amt = {int(r[0]): r[1] for r in conn.execute(
+            "SELECT CASE WHEN div_kind='결산배당' AND SUBSTR(record_dt,5,2) <= '06' "
+            "            THEN CAST(SUBSTR(record_dt,1,4) AS INTEGER) - 1 "
+            "            ELSE CAST(SUBSTR(record_dt,1,4) AS INTEGER) END AS fy, "
+            "       SUM(total_amt) FROM dividend "
+            "WHERE srtn_cd=? AND total_amt IS NOT NULL GROUP BY fy", (code,))}
         theirs: Dict[int, float] = {}
+        theirs_amt: Dict[int, float] = {}
         for y in years:
             try:
-                theirs.update(dart.annual_dps(
-                    dart.fetch_alot_matter(limiter, corp, y, session=session), y))
+                _rows = dart.fetch_alot_matter(limiter, corp, y, session=session)
+                theirs.update(dart.annual_dps(_rows, y))
+                theirs_amt.update(dart.annual_amounts(_rows, y))
             except dart.DartQuotaExceeded as exc:
                 print(f"\n중단됨:\n{exc}")
                 conn.close()
                 return tally
             except dart.DartError as exc:
                 print(f"  {code} {name[:12]} — {exc}")
+        # ★ 어긋났을 때 **어느 쪽이 틀렸는지**를 총액으로 가린다.
+        #
+        #   주당배당금만 보면 "우리가 놓쳤나, 저쪽이 밀렸나" 를 구분할 수 없다.
+        #   총액은 그 배당에 단 하나뿐인 값이라 **지문 노릇**을 한다 — 사업보고서가
+        #   적은 총액이 우리 **다른 해** 총액과 같으면, 그 보고서가 그 해 배당을
+        #   적은 것이다(우리가 놓친 것이 아니다).
+        #
+        #   실측: 고려아연 FY2020 사업보고서(접수 20210316000528) 당기 총액
+        #   247,439백만원 = 우리 **기준일 2019-12-31** 배당 총액 247,439,360,000원.
+        #   같은 회사의 2021~2023 은 어긋나지 않으므로 "회사마다 표기가 다르다" 가
+        #   아니라 **그 보고서 한 건이 밀린 것**이다.
+        #
+        #   주의: 자동으로 **보정하지 않는다.** 표시만 한다 — 잘못된 자동 보정은
+        #   틀린 값을 조용히 맞는 값으로 둔갑시킨다.
+        def _explain(y: int) -> str:
+            tam = theirs_amt.get(y)
+            if not tam:
+                return ""
+            for y2, oam in sorted(ours_amt.items()):
+                if oam and y2 != y and abs(round(oam / 1e6) - tam) <= 1:
+                    return f"  🔄 총액은 우리 {y2}년 배당과 같다 → 보고서가 밀렸다"
+            return ""
+
         for y in sorted(set(ours) & set(theirs)):
             a, b = ours[y], theirs[y]
             tally["checked"] += 1
@@ -360,15 +412,21 @@ def run_crosscheck(*, codes: Optional[List[str]] = None, limit: int = 12,
             else:
                 tally["differ"] += 1
                 mark = "❗"
-            print(f"{code:<8}{name[:13]:<14}{y:<6}{a:>11,.0f}{b:>11,.0f}{gap:>10,.0f}  {mark}")
+            why = _explain(y) if gap else ""
+            if why:
+                tally["shifted"] += 1
+            print(f"{code:<8}{name[:13]:<14}{y:<6}{a:>11,.0f}{b:>11,.0f}{gap:>10,.0f}  {mark}{why}")
         tally["missing"] += len(set(ours) - set(theirs))
 
     conn.close()
     print("-" * 62)
     print(f"대조 {tally['checked']}건 · 일치 {tally['agree']} · 어긋남 {tally['differ']} · "
           f"사업보고서에 없는 연도 {tally['missing']}")
+    if tally["shifted"]:
+        print(f"  🔄 {tally['shifted']}건은 **사업보고서 쪽이 밀렸다** — 총액이 우리 다른 해 배당과 같다. "
+              "자동 보정하지 않고 표시만 한다.")
     if tally["differ"]:
-        print("  ⚠️ 어긋남은 위 머리말의 ①②③ 로 설명되는지 먼저 본다. 설명이 안 되면\n"
+        print("  ⚠️ 어긋남은 위 머리말의 ①②③④ 로 설명되는지 먼저 본다. 설명이 안 되면\n"
               "     그 종목·연도의 공시를 목록으로 직접 확인한다.")
     print(limiter.report())
     return tally
