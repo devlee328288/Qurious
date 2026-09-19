@@ -23,16 +23,20 @@
 ``document.xml`` (「현금ㆍ현물배당결정」 공시 본문)  **배당기준일이 정확히 나온다.**
 응답이 2KB 로 가볍고 표 형식이 고정돼 있다. → 이쪽을 주 경로로 쓴다.
 
-왜 전 기간이 아니라 배당철만 훑나
----------------------------------
+왜 달 단위로 훑나 — 그리고 왜 열두 달 전부인가
+----------------------------------------------
 ``list.json`` 은 회사를 안 지정하고 **기간+공시유형**으로 전체 조회가 된다. 다만 기간이
 3개월을 넘으면 거부되고(``status=100``), 한 달 수시공시가 5,000건을 넘어 100건씩 50여
 페이지다. 전 기간(6년 9개월)을 훑으면 목록·본문 합쳐 약 39,000회 — 하루 한도 20,000 을
 넘겨 **이틀**이 걸린다.
 
-배당 결의는 달이 정해져 있다: 결산배당은 1~3월, 분기·중간배당은 4·7·10월, 이사회를 미리
-여는 곳이 12월. 그 달만 훑으면 **하루 안에** 끝난다. 어느 달을 훑었는지는 ``ingest_day``
-에 남으므로, 나중에 달을 늘리면 **안 훑은 달만** 추가로 받는다.
+그래서 **달 단위**로 끊어 훑고, 어느 달을 훑었는지 ``ingest_day`` 에 남긴다. 그러면 다시
+돌려도 **안 훑은 달만** 받는다.
+
+⚠️ 처음에는 "배당철" 일곱 달만 훑었다. **틀렸다** — 상세는 ``DIVIDEND_MONTHS`` 주석에
+   있다. 결론만 적으면, 공시는 **기준일이 아니라 이사회 결의일에** 나가고 그 달은 회사마다
+   달라서 **미리 고를 수 없다.** 열두 달 전부 훑는다(목록 약 2,800회 + 본문 약 12,000회
+   = 하루 한도 20,000 안쪽).
 
 배당락일을 어떻게 구하나 — ★ "T-2" 가 아니다
 ---------------------------------------------
@@ -77,11 +81,22 @@ import requests
 from collector import config, raw_store
 from collector.ratelimit import RateLimiter
 
-#: 배당 결의가 몰리는 달. 이 달만 목록을 훑는다.
+#: 목록을 훑을 달. **열두 달 전부다.**
 #:
-#: 1~3월 결산배당 · 4·7·10월 분기/중간배당 · 12월 이사회를 미리 여는 곳.
-#: 늘려도 손해가 없다(이미 훑은 달은 건너뛴다). 줄이면 그 달 배당을 통째로 놓친다.
-DIVIDEND_MONTHS = (1, 2, 3, 4, 7, 10, 12)
+#: ⚠️ 처음에는 "배당철" 만 골라 `(1,2,3,4,7,10,12)` 로 뒀다. **틀렸다.** 교차검증에서
+#:    잡혔다 — `alotMatter`(사업보고서 연간 합계)와 우리 날짜별 합계를 8종목에 대해
+#:    맞춰 보니 신한지주가 2021·2022 에 각각 300·400원씩 모자랐다. 이유를 캐 보니
+#:    **신한지주의 2분기 배당 공시가 8월에 접수된다**(2021-08-13 · 2022-08-12 실측).
+#:    8월은 그 목록에 없었다.
+#:
+#: 왜 달을 고를 수 없나: **기준일이 아니라 이사회 결의일에 공시가 나간다.** 같은
+#: 기준일(6-30) 배당도 6월에 미리 결의하는 회사, 7월에 하는 회사, 8월에 하는 회사가
+#: 모두 있다. 어느 회사가 어느 달에 결의하는지는 **미리 알 방법이 없다.**
+#:
+#: 비용: 한 달 수시공시가 2,151~6,809건이라 100건씩 22~69쪽. 열두 달 × 7년이면 목록
+#: 약 2,800회 + 본문 약 12,000회 = 15,000회 안쪽으로, 하루 한도 20,000 안에 든다.
+#: **놓친 배당은 영영 모르므로** 여유를 줄이는 쪽을 택한다.
+DIVIDEND_MONTHS = tuple(range(1, 13))
 
 #: 목록에서 배당 공시를 골라내는 조건. 제목에 이 글자가 있으면 본문을 받는다.
 #:
@@ -104,7 +119,23 @@ DIVIDEND_KEYWORD = "배당"
 #: ``주주명부폐쇄``  「현금ㆍ현물배당을위한주주명부폐쇄(기준일)결정」 은 기준일만 정하는
 #:   공시로 **배당금이 안 적혀 있다.** 금액은 나중에 「현금ㆍ현물배당결정」 으로 나온다.
 #:   🟡 기준일 교차검증에는 쓸 수 있어, 버리지 말고 세어서 보고만 한다.
-DIVIDEND_EXCLUDE = ("자회사", "종속회사", "주주명부폐쇄")
+#:
+#: ``주식배당``  「주식배당결정」 은 **현금이 아니라 주식**을 준다. 이 표에 넣으면 안 되는
+#:   이유가 둘이다. ① 서식이 달라 "1주당 배당금(원)" 칸이 없다(실측 24건 전부 금액 미검출).
+#:   ② **거래소가 배당락일에 기준가를 조정한다** — 주식수가 늘기 때문이다. 그래서 이미
+#:   `vs` 를 통해 `corporate_action` 표에 잡혀 있고, 여기에 또 담으면 **이중 계상**이다.
+#:   🟢 실측으로 확인했다: 기준일 2020-12-31 주식배당 공시 22종목이 **22/22 전부**
+#:      우리가 역산한 배당락일 `20201229` 에 `corporate_action` 에 들어 있었다.
+#: ``기타경영사항``  「기타경영사항(자율공시)(**배당기준일 변경 안내**)」 류다. 기준일을
+#:   알리는 공시로 **금액이 없다.** 전량 적재에서 **399건**이 잡혔고, 연도 분포가
+#:   2023년 85 → 2024년 154 → 2025년 159 로 **2024년 배당기준일 제도 변경**과 정확히
+#:   겹친다(기준일을 배당액 확정 후로 미룰 수 있게 되어 회사들이 변경을 알렸다).
+#:   🟡 **버리지만 아깝다** — 어느 회사가 언제 기준일을 옮겼는지가 여기 있다. 제도 변경이
+#:      우리 역산에 영향을 주는지 볼 때 이 공시들이 1차 자료가 된다(#33 10.5 의 🟡).
+#:
+#: ``기업가치제고계획``  「…(고배당기업 표시를 위한 재공시)」 1건. 배당 결정이 아니다.
+DIVIDEND_EXCLUDE = ("자회사", "종속회사", "주주명부폐쇄", "주식배당",
+                    "기타경영사항", "기업가치제고계획")
 
 #: 본문에서 **정정신고 블록이 끝나고 실제 서식이 시작되는 자리**를 찾는 표시.
 #:
@@ -175,13 +206,28 @@ class ScanResult:
     dividend_reports: int = 0     # 본문을 받을 대상
     rows: List[Dict] = field(default_factory=list)
     excluded: List[Dict] = field(default_factory=list)  # 제목에 '배당'은 있으나 제외된 것
+    #: 제외 사유별 건수. "무엇을 왜 버렸나" 를 보고에 남기려고 센다.
+    excluded_by: Dict[str, int] = field(default_factory=dict)
+
+
+def exclude_reason(report_nm: str) -> str:
+    """제목만 보고 제외 사유를 돌려준다. 받아야 할 공시면 빈 문자열.
+
+    사유를 **이름으로** 돌려주는 이유: 제외 건수만 세면 "무엇을 왜 버렸나" 가 사라진다.
+    특히 ``주식배당`` 은 버리는 게 아니라 **다른 표(`corporate_action`)가 이미 갖고 있는
+    것**이라, 그 구분이 보고에 남아야 한다.
+    """
+    if DIVIDEND_KEYWORD not in report_nm:
+        return "무관"
+    for x in DIVIDEND_EXCLUDE:
+        if x in report_nm:
+            return x
+    return ""
 
 
 def is_dividend_report(report_nm: str) -> bool:
     """제목만 보고 **본문을 받을지** 정한다. 제외 근거는 ``DIVIDEND_EXCLUDE`` 주석."""
-    if DIVIDEND_KEYWORD not in report_nm:
-        return False
-    return not any(x in report_nm for x in DIVIDEND_EXCLUDE)
+    return exclude_reason(report_nm) == ""
 
 
 # ==================================================
@@ -548,10 +594,13 @@ def scan_month(conn: sqlite3.Connection, limiter: RateLimiter, ym: str, *,
         if page == 1:
             res.total_reports = total
         for row in rows:
-            if is_dividend_report(row.get("report_nm") or ""):
+            why = exclude_reason(row.get("report_nm") or "")
+            if why == "":
                 res.rows.append(row)
-            elif DIVIDEND_KEYWORD in (row.get("report_nm") or ""):
-                res.excluded.append(row)   # 세어서 보고만 한다 (DIVIDEND_EXCLUDE 참고)
+            elif why != "무관":
+                # 세어서 보고만 한다 (DIVIDEND_EXCLUDE 참고)
+                res.excluded.append(row)
+                res.excluded_by[why] = res.excluded_by.get(why, 0) + 1
         if page >= max(total_page, 1):
             break
         page += 1
@@ -615,8 +664,85 @@ def done_months(conn: sqlite3.Connection) -> Dict[str, sqlite3.Row]:
 
 
 # ==================================================
-# 6. 종목코드 매핑
+# 6. 교차검증 — 사업보고서 배당 항목
 # ==================================================
+#: 사업보고서. `alotMatter` 는 보고서 종류를 받는데, 연간 확정치는 이것이다.
+REPRT_ANNUAL = "11011"
+
+
+def fetch_alot_matter(limiter: RateLimiter, corp_code: str, bsns_year: int, *,
+                      session: Optional[requests.Session] = None) -> List[Dict]:
+    """사업보고서의 배당 항목. 한 번 호출에 **3개년**(당기·전기·전전기)이 온다."""
+    r = _get(limiter, config.DART_ALOT_URL, {
+        "corp_code": corp_code, "bsns_year": str(bsns_year),
+        "reprt_code": REPRT_ANNUAL}, session=session)
+    if r.status_code != 200:
+        raise DartError(f"alotMatter HTTP {r.status_code} ({corp_code} {bsns_year})")
+    doc = r.json()
+    status = str(doc.get("status", ""))
+    _check_status(status, str(doc.get("message", "")), f"alotMatter {corp_code} {bsns_year}")
+    if status == DART_NO_DATA:
+        return []
+    return doc.get("list") or []
+
+
+def annual_dps(rows: List[Dict], bsns_year: int) -> Dict[int, float]:
+    """보통주 「주당 현금배당금(원)」을 ``{연도: 값}`` 으로. 연간 **합계**다.
+
+    ⚠️ 응답의 ``bsns_year`` 는 **None 으로 온다** — API 가 요청 값을 되돌려 주지 않는다.
+       그래서 연도는 **우리가 요청한 값**으로 센다. 응답 필드를 믿었다가 표본 8종목이
+       통째로 "결측" 으로 나왔다(실측).
+    """
+    out: Dict[int, float] = {}
+    for it in rows:
+        name = (it.get("se") or "").replace(" ", "")
+        kind = (it.get("stock_knd") or "").replace(" ", "")
+        if "주당현금배당금" not in name:
+            continue
+        if kind and "보통" not in kind:
+            continue
+        for key, back in (("thstrm", 0), ("frmtrm", 1), ("lwfr", 2)):
+            v = (it.get(key) or "").replace(",", "").strip()
+            if v in ("", "-", "–", "—"):
+                continue
+            try:
+                out[bsns_year - back] = float(v)
+            except ValueError:
+                pass
+    return out
+
+
+# ==================================================
+# 7. 종목코드 매핑
+# ==================================================
+def annual_amounts(rows: List[Dict], bsns_year: int) -> Dict[int, float]:
+    """「현금배당금총액(백만원)」을 ``{연도: 백만원}`` 으로.
+
+    **왜 총액까지 읽나**: 주당배당금만으로는 사업보고서가 *어느 해 배당*을 적었는지
+    알 수 없다. 총액은 그 해에 단 하나뿐인 값이라 **지문 노릇**을 한다.
+
+    실제로 이것이 고려아연의 어긋남을 확정했다 — FY2020 사업보고서의 당기 총액
+    247,439백만원이 우리가 **기준일 2019-12-31** 공시 원문에서 읽은
+    247,439,360,000원과 같았다. 즉 그 보고서가 한 해 밀려 적힌 것이고, 우리 값이
+    틀린 것이 아니다. 주당배당금(14,000원)만 봤다면 어느 쪽이 맞는지 알 수 없었다.
+
+    단위 주의: 응답은 **백만원**, 우리 ``dividend.total_amt`` 는 **원**이다.
+    """
+    out: Dict[int, float] = {}
+    for it in rows:
+        if "현금배당금총액" not in (it.get("se") or "").replace(" ", ""):
+            continue
+        for key, back in (("thstrm", 0), ("frmtrm", 1), ("lwfr", 2)):
+            v = (it.get(key) or "").replace(",", "").strip()
+            if v in ("", "-", "\u2013", "\u2014"):
+                continue
+            try:
+                out[bsns_year - back] = float(v)
+            except ValueError:
+                pass
+    return out
+
+
 def corp_code_map() -> Dict[str, List[str]]:
     """종목코드(6자리) → ``[corp_code, 회사명]``.
 

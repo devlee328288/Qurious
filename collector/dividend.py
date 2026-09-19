@@ -2,19 +2,25 @@
 
 무엇을 하나
 -----------
-DART 「현금ㆍ현물배당결정」 공시를 배당철만 훑어 ``dividend`` 표를 채운다. 규칙과 근거는
+DART 「현금ㆍ현물배당결정」 공시를 달 단위로 훑어 ``dividend`` 표를 채운다. 규칙과 근거는
 ``collector/sources/dart.py`` 머리말에 있다. 이 파일은 **순서와 재개**를 맡는다.
 
-네 가지 모드
-------------
-``corp-code``  종목코드↔기업고유번호 매핑을 만든다. 호출 1회. 처음에 한 번.
-``scan``       배당철 달을 훑는다. 이미 훑은 달은 건너뛴다.
-``reparse``    **네트워크를 한 번도 안 타고** 보존 원문으로 다시 파싱한다.
-``status``     지금까지 무엇이 쌓였는지.
+다섯 가지 모드
+--------------
+``corp-code``   종목코드↔기업고유번호 매핑을 만든다. 호출 1회. 처음에 한 번.
+``scan``        달 단위로 훑는다. 이미 훑은 달은 건너뛴다.
+``reparse``     **네트워크를 한 번도 안 타고** 보존 원문으로 다시 파싱한다.
+``crosscheck``  사업보고서 연간 확정치와 대조한다. **공시를 놓쳤는지 알 유일한 방법.**
+``status``      지금까지 무엇이 쌓였는지.
 
 ``reparse`` 가 있는 이유가 이 설계의 요점이다. 파싱 규칙은 틀리고, 고치면 전부 다시
 읽어야 한다. 원문을 남겨 두었으므로(``raw_response``) 그때 하루 한도를 쓰지 않는다.
 실제로 이 수집기를 만들면서 파서를 두 번 고쳤다.
+
+``crosscheck`` 는 **빠진 것을 찾는** 장치다. 주 경로(공시 본문)는 공시를 하나라도 놓치면
+조용히 적게 나오고, 빠진 자리에 아무 표시도 남지 않는다. 그래서 다른 경로(사업보고서
+연간 합계)와 맞춰 보는 것 말고는 알아낼 방법이 없다. 실제로 이 검증이 ``DIVIDEND_MONTHS``
+버그를 잡았다 — "배당철" 7달만 훑었더니 **8월에 공시되는 2분기 배당**이 빠져 있었다.
 
 재개는 어디에 기대나
 --------------------
@@ -66,7 +72,7 @@ def process_month(conn: sqlite3.Connection, limiter: RateLimiter, ym: str, *,
     tally = {"list_calls": scan.list_calls, "reports": scan.total_reports,
              "candidates": len(scan.rows), "excluded": len(scan.excluded),
              "no_code": 0, "no_record_dt": 0, "subsidiary": 0, "no_file": 0,
-             "review": 0, "saved": 0}
+             "review": 0, "saved": 0, "out_of_range": 0}
 
     items: List[dart.Dividend] = []
     for row in scan.rows:
@@ -109,9 +115,14 @@ def process_month(conn: sqlite3.Connection, limiter: RateLimiter, ym: str, *,
         ex = dart.ex_dividend_date(cal, d.record_dt)
         d.ex_div_dt = ex or ""
         if not ex:
-            d.needs_review = 1
+            # ⚠️ 이것은 **파싱 실패가 아니다.** 기준일이 우리 시세 구간(2020-01-02~) 앞이라
+            #    배당락일을 구할 거래일이 없는 것이다. 그런 배당은 배당락일이 이미 지나
+            #    있으므로 우리 백테스트 구간의 수익률에 더해서도 안 된다 — 제대로 비어야
+            #    하는 칸이다. `needs_review` 를 세우면 진짜 문제(금액을 못 읽음)가 이
+            #    1,000여 건에 묻힌다.
             d.note = (d.note + " / " if d.note else "") + \
-                     f"배당락일 미정 — 기준일 {d.record_dt} 이 거래일 달력 밖이다"
+                     f"배당락일 없음 — 기준일 {d.record_dt} 이 거래일 달력(2020-01-02~) 앞이다"
+            tally["out_of_range"] += 1
         if d.needs_review:
             tally["review"] += 1
         items.append(d)
@@ -125,7 +136,8 @@ def process_month(conn: sqlite3.Connection, limiter: RateLimiter, ym: str, *,
             f"저장 {tally['saved']}건 · 검토 {tally['review']}건 · "
             f"제목제외 {tally['excluded']}건 · 자회사 {tally['subsidiary']}건 · "
             f"코드없음 {tally['no_code']}건 · 기준일없음 {tally['no_record_dt']}건 · "
-            f"본문없음 {tally['no_file']}건")
+            f"본문없음 {tally['no_file']}건 · 구간밖 {tally['out_of_range']}건 · "
+            f"제외내역 {scan.excluded_by or '-'}")
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
@@ -138,7 +150,8 @@ def process_month(conn: sqlite3.Connection, limiter: RateLimiter, ym: str, *,
               + (f" · 자회사 {tally['subsidiary']}" if tally["subsidiary"] else "")
               + (f" · 코드없음 {tally['no_code']}" if tally["no_code"] else "")
               + (f" · 기준일없음 {tally['no_record_dt']}" if tally["no_record_dt"] else "")
-              + (f" · 본문없음 {tally['no_file']}" if tally["no_file"] else ""))
+              + (f" · 본문없음 {tally['no_file']}" if tally["no_file"] else "")
+              + (f" · 구간밖 {tally['out_of_range']}" if tally["out_of_range"] else ""))
     return tally
 
 
@@ -154,7 +167,7 @@ def run_scan(*, from_year: int = DEFAULT_FROM_YEAR, to_year: Optional[int] = Non
              months: Optional[Tuple[int, ...]] = None, limit: Optional[int] = None,
              max_calls: Optional[int] = None, rescan: bool = False,
              quiet: bool = False) -> Dict[str, int]:
-    """배당철을 훑는다. 한도에 닿으면 **깔끔히 멈추고** 지금까지를 보고한다."""
+    """달 단위로 훑는다. 한도에 닿으면 **깔끔히 멈추고** 지금까지를 보고한다."""
     to_year = to_year or datetime.now().year
     if months:
         wanted = [f"{y}{m:02d}" for y in range(from_year, to_year + 1) for m in months]
@@ -174,7 +187,8 @@ def run_scan(*, from_year: int = DEFAULT_FROM_YEAR, to_year: Optional[int] = Non
         todo = todo[:limit]
 
     total = {"months": 0, "saved": 0, "review": 0, "candidates": 0, "excluded": 0,
-             "subsidiary": 0, "no_code": 0, "no_record_dt": 0, "no_file": 0}
+             "subsidiary": 0, "no_code": 0, "no_record_dt": 0, "no_file": 0,
+             "out_of_range": 0}
     if not todo:
         print(f"훑을 달이 없다 — 대상 {len(wanted)}달이 모두 처리돼 있다.")
         conn.close()
@@ -182,7 +196,7 @@ def run_scan(*, from_year: int = DEFAULT_FROM_YEAR, to_year: Optional[int] = Non
 
     done_n = sum(1 for ym in wanted
                  if (states.get(ym) or {"status": ""})["status"] == "done")
-    print(f"대상 {len(todo)}달 (배당철 {len(wanted)}달 중 {done_n}달은 이미 처리됨"
+    print(f"대상 {len(todo)}달 (전체 {len(wanted)}달 중 {done_n}달은 이미 처리됨"
           + (f" · --limit 로 {len(wanted) - done_n - len(todo)}달은 이번에 제외" if limit else "")
           + ")")
     code_by_corp = _code_index()
@@ -198,14 +212,16 @@ def run_scan(*, from_year: int = DEFAULT_FROM_YEAR, to_year: Optional[int] = Non
             break
         total["months"] += 1
         for k in ("saved", "review", "candidates", "excluded",
-                  "subsidiary", "no_code", "no_record_dt", "no_file"):
+                  "subsidiary", "no_code", "no_record_dt", "no_file",
+                  "out_of_range"):
             total[k] += t[k]
 
     conn.close()
     print(f"\n훑은 달 {total['months']}달 · 저장 {total['saved']:,}건 "
           f"(검토필요 {total['review']:,}건) · 제목제외 {total['excluded']:,}건 · "
           f"자회사 {total['subsidiary']:,}건 · 코드없음 {total['no_code']:,}건 · "
-          f"기준일없음 {total['no_record_dt']:,}건 · 본문없음 {total['no_file']:,}건")
+          f"기준일없음 {total['no_record_dt']:,}건 · 본문없음 {total['no_file']:,}건 · "
+          f"구간밖 {total['out_of_range']:,}건")
     print(limiter.report())
     if stopped:
         print(f"\n중단됨:\n{stopped}")
@@ -221,11 +237,19 @@ def run_reparse(*, quiet: bool = False) -> Dict[str, int]:
     conn = db.connect()
     cal = dart.trading_days(conn)
     rows = conn.execute(
-        "SELECT srtn_cd, rcept_no, corp_code, itms_nm, report_nm FROM dividend "
+        "SELECT srtn_cd, record_dt, rcept_no, corp_code, itms_nm, report_nm FROM dividend "
         "WHERE rcept_no <> '' ORDER BY rcept_no").fetchall()
-    tally = {"read": 0, "missing_raw": 0, "saved": 0, "review": 0, "dropped": 0}
+    tally = {"read": 0, "missing_raw": 0, "saved": 0, "review": 0,
+             "dropped": 0, "pruned": 0, "out_of_range": 0}
     items: List[dart.Dividend] = []
+    prune: List[Tuple[str, str]] = []
     for r in rows:
+        # 제외 규칙이 뒤에 바뀌면 이미 담긴 행이 남는다. 재파싱이 **스스로 치운다** —
+        # 안 그러면 '주식배당' 처럼 나중에 걸러낸 것이 표에 영원히 남는다.
+        if not dart.is_dividend_report(r["report_nm"] or ""):
+            prune.append((r["srtn_cd"], r["record_dt"]))
+            tally["pruned"] += 1
+            continue
         kept = raw_store.load(conn, "dart", f"dividend/{r['rcept_no']}")
         if not kept:
             tally["missing_raw"] += 1
@@ -239,12 +263,18 @@ def run_reparse(*, quiet: bool = False) -> Dict[str, int]:
             tally["dropped"] += 1
             continue
         d.ex_div_dt = dart.ex_dividend_date(cal, d.record_dt) or ""
+        if not d.ex_div_dt:
+            d.note = (d.note + " / " if d.note else "") +                      f"배당락일 없음 — 기준일 {d.record_dt} 이 거래일 달력(2020-01-02~) 앞이다"
+            tally["out_of_range"] += 1
         if d.needs_review:
             tally["review"] += 1
         items.append(d)
 
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if prune:
+            conn.executemany(
+                "DELETE FROM dividend WHERE srtn_cd=? AND record_dt=?", prune)
         tally["saved"] = dart.upsert(conn, items)
         conn.execute("COMMIT")
     except Exception:
@@ -254,13 +284,156 @@ def run_reparse(*, quiet: bool = False) -> Dict[str, int]:
     print(f"보존 원문 {tally['read']:,}건 재파싱 → 저장 {tally['saved']:,}건 "
           f"(검토필요 {tally['review']:,}건 · 기준일없음 {tally['dropped']:,}건 · "
           f"원문없음 {tally['missing_raw']:,}건)")
+    if tally["pruned"]:
+        print(f"  · 제외 규칙이 바뀌어 {tally['pruned']:,}건을 표에서 지웠다 "
+              "(원문은 raw_response 에 그대로 남는다)")
+    if tally["out_of_range"]:
+        print(f"  · 배당락일 없음 {tally['out_of_range']:,}건 — 기준일이 시세 구간 앞이다. "
+              "파싱 실패가 아니다")
     if tally["dropped"]:
         print("  ⚠️ 기준일을 못 읽은 건은 표에 담기지 않는다 — 이전 값이 남아 있을 수 있다.")
     return tally
 
 
 # ==================================================
-# 3. 현황
+# 3. 교차검증 — 두 경로를 맞춰 본다
+# ==================================================
+def run_crosscheck(*, codes: Optional[List[str]] = None, limit: int = 12,
+                   years: Tuple[int, ...] = (2023, 2020)) -> Dict[str, int]:
+    """공시 본문에서 모은 **날짜별 배당의 연간 합계** vs 사업보고서 **연간 확정치**.
+
+    왜 필요한가: 우리 주 경로(공시 본문)는 **공시를 하나라도 놓치면 조용히 적게** 나온다.
+    빠진 것은 빠진 자리에 아무 표시를 남기지 않으므로, **다른 경로와 맞춰 보는 것 말고는
+    알아낼 방법이 없다.**
+
+    실제로 이 검증이 버그를 잡았다 — 처음 ``DIVIDEND_MONTHS`` 를 "배당철" 7달로 뒀더니
+    신한지주 2분기 배당(8월 공시)이 통째로 빠졌다. 그래서 열두 달 전부로 바꿨다.
+
+    ⚠️ 어긋남이 곧 결함은 아니다. 아래 셋은 **설명되는 어긋남**이다.
+       ① 우리 수집 구간(2020-01~) **앞의 공시** — 2019년 분기배당은 2019년에 공시됐다
+       ② 아직 안 훑은 달 — 예: 2023년 결산배당 공시는 **2024년 2~3월**에 나온다
+       ③ 인적분할·합병이 끼면 주당 금액이 **비교 자체가 안 된다**
+       ④ 3월·6월 결산법인 — 아래 사업연도 매핑이 12월 결산을 가정한다
+
+    ★ ②는 "안 훑은 달" 만이 아니었다. 2023년 말 배당절차 개선으로 **결산배당의
+      기준일이 사업연도 밖(이듬해 2~4월)으로 나가는 회사**가 늘었다. 기준일 연도로
+      사업연도를 세면 그것만으로 어긋난다 — 코드가 아니라 집계 기준의 문제다.
+    """
+    conn = db.connect()
+    limiter = _limiter()
+    session = requests.Session()
+    cmap = dart.corp_code_map()
+
+    if not codes:
+        # 배당을 많이 준 종목부터 — 어긋나면 영향이 큰 쪽을 먼저 본다
+        codes = [r[0] for r in conn.execute(
+            "SELECT srtn_cd FROM dividend WHERE dps IS NOT NULL "
+            "GROUP BY srtn_cd ORDER BY SUM(dps) DESC LIMIT ?", (limit,))]
+
+    tally = {"checked": 0, "agree": 0, "differ": 0, "missing": 0, "shifted": 0}
+    print(f"{'종목':<8}{'이름':<14}{'연도':<6}{'우리(합계)':>11}{'사업보고서':>11}{'차이':>10}")
+    print("-" * 62)
+    for code in codes:
+        ent = cmap.get(code)
+        if not ent:
+            continue
+        corp = ent[0]
+        row = conn.execute("SELECT itms_nm FROM price_daily WHERE srtn_cd=? LIMIT 1",
+                           (code,)).fetchone()
+        name = row[0] if row else ent[1]
+        # 사업연도 매핑. **기준일 연도가 곧 사업연도가 아니다.**
+        #
+        # 2023년 말 배당절차 개선(배당액을 먼저 정하고 기준일을 뒤에 두도록 한 것)
+        # 이후로, FY2023 결산배당의 기준일이 **2024-02-29** 인 사례가 흔하다
+        # (현대차 8,400원 · POSCO 2,500원 실측 · 둘 다 결의일은 2024-01). 기준일
+        # 연도로 세면 그 배당이 FY2024 로 잡혀 사업보고서와 어긋난다.
+        #
+        # 실측 추세 — 결산배당 중 기준일이 12-31 이 **아닌** 것의 비율:
+        #   2020~2023 약 2% → **2024 12%(128건)** → **2025 26%(293건)**
+        #   통념("12월 결산법인의 배당기준일은 12-31")이 깨지는 중이다.
+        #
+        # 주의: 12월 결산법인을 가정한다. 3월·6월 결산법인은 이 규칙으로 어긋난다.
+        ours = {int(r[0]): r[1] for r in conn.execute(
+            "SELECT CASE WHEN div_kind='결산배당' AND SUBSTR(record_dt,5,2) <= '06' "
+            "            THEN CAST(SUBSTR(record_dt,1,4) AS INTEGER) - 1 "
+            "            ELSE CAST(SUBSTR(record_dt,1,4) AS INTEGER) END AS fy, "
+            "       SUM(dps) FROM dividend "
+            "WHERE srtn_cd=? AND dps IS NOT NULL GROUP BY fy", (code,))}
+        # 총액(원). 사업연도 매핑은 위 ours 와 같은 규칙을 쓴다.
+        ours_amt = {int(r[0]): r[1] for r in conn.execute(
+            "SELECT CASE WHEN div_kind='결산배당' AND SUBSTR(record_dt,5,2) <= '06' "
+            "            THEN CAST(SUBSTR(record_dt,1,4) AS INTEGER) - 1 "
+            "            ELSE CAST(SUBSTR(record_dt,1,4) AS INTEGER) END AS fy, "
+            "       SUM(total_amt) FROM dividend "
+            "WHERE srtn_cd=? AND total_amt IS NOT NULL GROUP BY fy", (code,))}
+        theirs: Dict[int, float] = {}
+        theirs_amt: Dict[int, float] = {}
+        for y in years:
+            try:
+                _rows = dart.fetch_alot_matter(limiter, corp, y, session=session)
+                theirs.update(dart.annual_dps(_rows, y))
+                theirs_amt.update(dart.annual_amounts(_rows, y))
+            except dart.DartQuotaExceeded as exc:
+                print(f"\n중단됨:\n{exc}")
+                conn.close()
+                return tally
+            except dart.DartError as exc:
+                print(f"  {code} {name[:12]} — {exc}")
+        # ★ 어긋났을 때 **어느 쪽이 틀렸는지**를 총액으로 가린다.
+        #
+        #   주당배당금만 보면 "우리가 놓쳤나, 저쪽이 밀렸나" 를 구분할 수 없다.
+        #   총액은 그 배당에 단 하나뿐인 값이라 **지문 노릇**을 한다 — 사업보고서가
+        #   적은 총액이 우리 **다른 해** 총액과 같으면, 그 보고서가 그 해 배당을
+        #   적은 것이다(우리가 놓친 것이 아니다).
+        #
+        #   실측: 고려아연 FY2020 사업보고서(접수 20210316000528) 당기 총액
+        #   247,439백만원 = 우리 **기준일 2019-12-31** 배당 총액 247,439,360,000원.
+        #   같은 회사의 2021~2023 은 어긋나지 않으므로 "회사마다 표기가 다르다" 가
+        #   아니라 **그 보고서 한 건이 밀린 것**이다.
+        #
+        #   주의: 자동으로 **보정하지 않는다.** 표시만 한다 — 잘못된 자동 보정은
+        #   틀린 값을 조용히 맞는 값으로 둔갑시킨다.
+        def _explain(y: int) -> str:
+            tam = theirs_amt.get(y)
+            if not tam:
+                return ""
+            for y2, oam in sorted(ours_amt.items()):
+                if oam and y2 != y and abs(round(oam / 1e6) - tam) <= 1:
+                    return f"  🔄 총액은 우리 {y2}년 배당과 같다 → 보고서가 밀렸다"
+            return ""
+
+        for y in sorted(set(ours) & set(theirs)):
+            a, b = ours[y], theirs[y]
+            tally["checked"] += 1
+            gap = a - b
+            if abs(gap) < 0.5:
+                tally["agree"] += 1
+                mark = "✅"
+            else:
+                tally["differ"] += 1
+                mark = "❗"
+            why = _explain(y) if gap else ""
+            if why:
+                tally["shifted"] += 1
+            print(f"{code:<8}{name[:13]:<14}{y:<6}{a:>11,.0f}{b:>11,.0f}{gap:>10,.0f}  {mark}{why}")
+        tally["missing"] += len(set(ours) - set(theirs))
+
+    conn.close()
+    print("-" * 62)
+    print(f"대조 {tally['checked']}건 · 일치 {tally['agree']} · 어긋남 {tally['differ']} · "
+          f"사업보고서에 없는 연도 {tally['missing']}")
+    if tally["shifted"]:
+        print(f"  🔄 {tally['shifted']}건은 **사업보고서 쪽이 밀렸다** — 총액이 우리 다른 해 배당과 같다. "
+              "자동 보정하지 않고 표시만 한다.")
+    if tally["differ"]:
+        print("  ⚠️ 어긋남은 위 머리말의 ①②③④ 로 설명되는지 먼저 본다. 설명이 안 되면\n"
+              "     그 종목·연도의 공시를 목록으로 직접 확인한다.")
+    print(limiter.report())
+    return tally
+
+
+# ==================================================
+# 4. 현황
 # ==================================================
 def print_status() -> None:
     conn = db.connect()
@@ -272,6 +445,19 @@ def print_status() -> None:
         print("  아직 아무것도 훑지 않았다. `python -m collector.dividend scan` 으로 시작한다.")
     for r in rows:
         print(f"  {r['status']:<8} {r['n']:>4}달  {(r['r'] or 0):>8,}건")
+
+    # ⚠️ 덮어쓰기 감시. 기본키가 (종목, 기준일)이라 같은 짝에 공시가 둘 오면 하나가
+    #    사라진다. 정정공시라면 그게 맞다(나중 접수번호가 이긴다). 그런데 **종류가 다른**
+    #    공시가 같은 짝을 쓰면 멀쩡한 배당이 지워진다 — 실제로 「주식배당결정」이
+    #    「현금ㆍ현물배당결정」에 덮여 사라지는 것을 봤고, 그래서 주식배당을 제외했다.
+    #    수를 띄워 두는 것은 같은 일이 또 생기면 **눈에 띄게** 하려는 것이다.
+    ing = conn.execute("SELECT COALESCE(SUM(rows),0) FROM ingest_day "
+                       "WHERE source='dart_dividend'").fetchone()[0]
+    have = conn.execute("SELECT COUNT(*) FROM dividend").fetchone()[0]
+    if ing and ing != have:
+        print(f"\n  ⚠️ 달별 저장 합계 {ing:,}건 vs 표에 남은 행 {have:,}건 — "
+              f"{ing - have:,}건이 같은 (종목, 기준일)에 덮였다.")
+        print("     정정공시라면 정상이다. `report_nm` 에 [기재정정] 이 없는 짝이 있으면 확인한다.")
 
     s = conn.execute(
         "SELECT COUNT(*) n, COUNT(DISTINCT srtn_cd) c, MIN(record_dt) a, MAX(record_dt) b, "
@@ -291,24 +477,27 @@ def print_status() -> None:
 
 
 # ==================================================
-# 4. CLI
+# 5. CLI
 # ==================================================
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(
         prog="python -m collector.dividend",
         description="DART 배당 공시 수집 (중단·재개 가능)")
-    p.add_argument("mode", choices=["corp-code", "scan", "reparse", "status"],
-                   help="corp-code=종목코드 매핑 만들기(1회) / scan=배당철 훑기 / "
-                        "reparse=보존 원문 재파싱(네트워크 0회) / status=현황")
+    p.add_argument("mode",
+                   choices=["corp-code", "scan", "reparse", "crosscheck", "status"],
+                   help="corp-code=종목코드 매핑 만들기(1회) / scan=달 단위 훑기 / "
+                        "reparse=보존 원문 재파싱(네트워크 0회) / "
+                        "crosscheck=사업보고서와 대조 / status=현황")
     p.add_argument("--from-year", type=int, default=DEFAULT_FROM_YEAR)
     p.add_argument("--to-year", type=int)
-    p.add_argument("--months", help="훑을 달을 직접 지정 (예: 2,3). 기본은 배당철 전부")
+    p.add_argument("--months", help="훑을 달을 직접 지정 (예: 2,3). 기본은 열두 달 전부")
     p.add_argument("--limit", type=int, help="이번 실행에서 훑을 최대 달 수 — 시험 삼아 돌릴 때")
     p.add_argument("--max-calls", type=int,
                    default=config.DART_DAILY_LIMIT - config.DART_RESERVE,
                    help="이번 실행의 호출 상한. DART 는 남은 유량을 알려 주지 않아 직접 센다")
     p.add_argument("--rescan", action="store_true",
                    help="이미 훑은 달도 다시 훑는다 (본문은 보존본을 써서 목록만 다시 든다)")
+    p.add_argument("--codes", help="crosscheck 에서 대조할 종목코드 (예: 005930,033780)")
     p.add_argument("--quiet", action="store_true")
     a = p.parse_args(argv)
 
@@ -323,6 +512,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
     if a.mode == "reparse":
         run_reparse(quiet=a.quiet)
+        return 0
+    if a.mode == "crosscheck":
+        run_crosscheck(codes=a.codes.split(",") if a.codes else None, limit=a.limit or 12)
         return 0
 
     months = tuple(int(x) for x in a.months.split(",")) if a.months else None
