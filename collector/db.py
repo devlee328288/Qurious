@@ -9,7 +9,7 @@
 옮겨 갈 때를 대비해 표 모양은 Postgres 로 그대로 번역되게 잡아 두었다 — 특수 타입을
 쓰지 않고, 기본키를 자연키로 잡았다. 옮기는 일은 적재가 안정된 뒤에 한다.
 
-표 여섯
+표 일곱
 -------
 받은 것 (출처가 준 값 그대로) ::
 
@@ -20,8 +20,9 @@
 
 계산한 것 (언제든 지우고 다시 만든다) ::
 
-    price_adjusted    수정주가. preprocess 가 만든다.
-    corporate_action  가격이 끊긴 날과 그 계수.
+    price_adjusted     수정주가. preprocess 가 만든다. 분할·권리락만 고친 **PR** 계열.
+    corporate_action   가격이 끊긴 날과 그 계수.
+    price_total_return 총수익(TR) 계열. total_return 이 price_adjusted + dividend 로 만든다.
 
 **받은 것과 계산한 것을 섞지 않는다.** 계산 규칙은 바뀌고, 바뀌면 전부 다시 만들어야
 하는데 원본에 덮어써 두면 되돌릴 근거가 없어진다.
@@ -176,6 +177,34 @@ CREATE TABLE IF NOT EXISTS dividend (
 );
 CREATE INDEX IF NOT EXISTS ix_div_exdt ON dividend(ex_div_dt);
 CREATE INDEX IF NOT EXISTS ix_div_review ON dividend(needs_review);
+
+-- ── 7. 총수익 계열 (파생) ───────────────────────────────────────────────────
+-- price_adjusted(가격) + dividend(배당) = 실제로 번 돈.
+--
+-- 왜 price_adjusted 에 칸을 더하지 않고 표를 새로 두나: 둘은 **다시 만드는 조건이
+-- 다르다.** 수정주가는 시세가 새로 들어오면 다시 만들고, TR 은 거기에 더해 배당 공시가
+-- 새로 들어오거나 세율 가정이 바뀌면 다시 만든다. 한 표에 섞으면 배당 한 건 때문에
+-- 수정주가 전체를 다시 계산하게 되고, 반대로 수정주가만 고쳤는데 TR 이 옛 배당 가정을
+-- 그대로 물고 있는 일이 생긴다.
+--
+-- 지수는 종목마다 **첫 거래일을 1.0** 으로 둔다. 쓰는 쪽이 보는 것은 절대값이 아니라
+-- 두 날 사이의 비율이므로 시작점이 달라도 된다.
+-- ⚠️ price_adjusted 와 누적 방향이 반대다 — 수정주가는 오늘이 1.0(뒤→앞),
+--    TR 은 첫날이 1.0(앞→뒤). 이유는 total_return.py 의 build 머리말에 적었다.
+CREATE TABLE IF NOT EXISTS price_total_return (
+    bas_dt       TEXT NOT NULL,
+    srtn_cd      TEXT NOT NULL,
+    tr_index     REAL,                     -- 총수익 지수 (세전). 첫 거래일 = 1.0
+    tr_index_net REAL,                     -- 총수익 지수 (세후 15.4%)
+    pr_index     REAL,                     -- 가격수익 지수. 같은 기준 — 비교용
+    -- 그날의 배당 계수 = 1 + 주당배당금 ÷ 그날 종가. 배당이 없는 날은 1.0.
+    -- 같은 날의 두 값을 나눈 것이라 **분할 조정과 무관**하다(total_return.py 머리말).
+    div_factor   REAL NOT NULL DEFAULT 1.0,
+    dps_applied  REAL,                     -- 그날 실제로 더한 주당 배당금(원). 없으면 NULL
+    PRIMARY KEY (bas_dt, srtn_cd)
+);
+CREATE INDEX IF NOT EXISTS ix_tr_srtn ON price_total_return(srtn_cd, bas_dt);
+CREATE INDEX IF NOT EXISTS ix_tr_dps ON price_total_return(dps_applied);
 """
 
 
