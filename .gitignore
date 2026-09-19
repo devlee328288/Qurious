@@ -26,11 +26,18 @@ data/12*/
 data/1*/
 data/app.db
 data/vectors-cache.json
+# 수집기 산출물 — 원자료는 커밋하지 않는다 (SQLite·매니페스트·토큰 캐시)
+data/collector/
+
 
 # OS
 .DS_Store
 .Identifier
 Thumbs.db
+
+# 도구가 만드는 작업 폴더 (MCP 서버·에이전트 캐시)
+.playwright-mcp/
+.serena/
 
 # IDE
 .vscode/

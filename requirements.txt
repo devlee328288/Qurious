@@ -3,6 +3,11 @@ python-jose[cryptography]>=3.3.0
 uvicorn[standard]>=0.32.0
 python-multipart>=0.0.20
 httpx>=0.27.0
+# collector 패키지가 쓰는 유일한 외부 의존.
+# 앱은 httpx(비동기)를 쓰지만 수집기는 스택 없이 도는 동기 코드라 requests 를 쓴다.
+# ⚠️ pykrx · FinanceDataReader 는 넣지 않는다 — 둘 다 robots.txt 로 막힌 경로를
+#    타므로 사용하지 않기로 했다(#23 · #33).
+requests>=2.32.0
 redis[asyncio]>=5.2.0
 sqlalchemy[asyncio]>=2.0.36
 asyncpg>=0.30.0
